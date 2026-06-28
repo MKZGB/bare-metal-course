@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 · UART Transmit — Bare-Metal STM32</title>
+<link rel="stylesheet" href="../common/style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <a href="../README.md">Home</a>
+  <a href="../glossary.html">Glossary</a>
+  <a href="../05-gpio-input/05-gpio-input.html">‹ Prev</a>
+  <a href="../07-uart-receive/07-uart-receive.html">Next ›</a>
+  <a href="06-uart-transmit-pt.html">🌐 Português</a>
+  <span class="spacer"></span>
+  <span class="badge">STM32F100RBT6 · RM0041</span>
+</nav>
+
+<div class="wrap">
+
+<h1><span class="modnum">Module 06</span> UART Transmit — Your First Visible Output</h1>
+<p class="subtitle">Bring up <code>USART1</code> as a transmitter on <code>PA9</code>, write a tiny polled driver, then retarget <code>printf()</code> so the chip can <em>talk to you</em> over the serial console in QEMU.</p>
+
+<div class="box ok">
+  <span class="box-title">★ This is the module everything else builds on</span>
+  Until now QEMU showed you nothing (it does not emulate GPIO). <strong>It <em>does</em> fully emulate the USARTs.</strong> By the end of this page your firmware prints real text to your terminal — the channel you will use to debug every later module.
+</div>
+
+<div class="box note">
+  <span class="box-title">Dependencies</span>
+  You should be comfortable with <a href="../03-memory-mapped-registers/03-memory-mapped-registers.html">Module 03 (Memory-Mapped Registers)</a> and the clock-gating / <code>CRL</code>/<code>CRH</code> pin-config pattern from <a href="../04-gpio-output/04-gpio-output.html">Module 04 (GPIO Output)</a>. We reuse both here.
+</div>
+
+<!-- ============================== THEORY ============================== -->
+<span class="section-tag">Theory</span>
+<h2>1. What a UART does</h2>
+
+<p>A <strong>UART</strong> (Universal Asynchronous Receiver/Transmitter — on STM32 the peripheral is called <code>USART</code>, the "S" adding optional synchronous modes) turns a byte into a stream of bits sent one wire at a time. "Asynchronous" means there is <em>no clock line</em>: sender and receiver must agree in advance on the bit rate (the <strong>baud rate</strong>) and on the frame format.</p>
+
+<h3>1.1 The frame: start, data, stop</h3>
+<p>The TX line idles <strong>high</strong>. To send a byte the transmitter:</p>
+<ol>
+  <li>pulls the line <strong>low for one bit</strong> — the <em>start bit</em> (this falling edge is how the receiver knows a byte is coming);</li>
+  <li>shifts out the <strong>data bits</strong> (8 here), LSB first;</li>
+  <li>returns the line <strong>high for one (or more) bit(s)</strong> — the <em>stop bit</em>.</li>
+</ol>
+
+<div class="diagram">8N1 frame for the byte 'A' = 0x41 = 0b0100_0001  (LSB first)
+
+  idle   start | b0 b1 b2 b3 b4 b5 b6 b7 | stop   idle
+  ----,   ,----------,     ,----,        ,----------------
+      |   | 1  0  0  0  0  | 1  0| 0      |
+      '---'  (data bits, LSB first)       (line returns high)
+       \_ falling edge: receiver starts sampling
+
+"8N1" = 8 data bits, No parity, 1 stop bit  (the USART reset default).</div>
+
+<p>Each bit lasts exactly <code>1 / baud</code> seconds. At <strong>9600 baud</strong> a bit is ~104&nbsp;µs and a 10-bit frame (start + 8 data + stop) takes ~1.04&nbsp;ms.</p>
+
+<h3>1.2 Baud rate and the BRR register</h3>
+<p>The USART derives the bit timing by dividing its peripheral clock <code>f<sub>CK</sub></code> (here PCLK2 = HSI = <strong>8 MHz</strong>) by an oversampling factor of 16 times a programmable divisor <code>USARTDIV</code>:</p>
+
+<div class="diagram">baud = f_CK / (16 * USARTDIV)
+
+  For 9600 baud at 8 MHz:
+    USARTDIV = 8 000 000 / (16 * 9600) = 52.0833...
+
+  BRR splits USARTDIV into a 12-bit mantissa and a 4-bit fraction:
+    mantissa = 52      = 0x34   -> BRR[15:4]
+    fraction = round(0.0833 * 16) = 1 = 0x1  -> BRR[3:0]
+    BRR = 0x341</div>
+
+<p>So we write <code>USART1_BRR = 0x341</code>. (RM0041 §27.3.4.)</p>
+
+<div class="box warn">
+  <span class="box-title">QEMU ignores BRR — set it anyway</span>
+  QEMU does not model real bit timing, so the exact <code>BRR</code> value does not affect whether you see output. On <em>real</em> hardware a wrong <code>BRR</code> gives garbage on the terminal, so we always program it correctly. Set your host terminal to <strong>9600 8N1</strong> when connecting to a physical board.
+</div>
+
+<h3>1.3 The status flags: TXE vs TC</h3>
+<p>Inside the transmitter there are two stages: a writable <strong>data register</strong> (<code>DR</code>) and a <strong>shift register</strong> that actually clocks bits onto the wire. Two flags in <code>USART1_SR</code> tell you their state:</p>
+
+<table>
+  <tr><th>Flag</th><th>Bit</th><th>Meaning</th><th>Use it to…</th></tr>
+  <tr><td><code>TXE</code></td><td>7</td><td>TX data register <em>empty</em> — its byte has moved into the shift register, so <code>DR</code> can accept the next byte.</td><td>decide when it is safe to write the <em>next</em> byte (fast, keeps the pipe full)</td></tr>
+  <tr><td><code>TC</code></td><td>6</td><td>Transmission <em>complete</em> — the shift register has finished and the line is idle.</td><td>know the <em>last</em> byte has fully left the wire (e.g. before sleeping or disabling the USART)</td></tr>
+</table>
+
+<p>For a simple byte-at-a-time driver you poll <strong>TXE</strong>: as soon as it is set, write the next byte. You only need <strong>TC</strong> when you must be sure the very last bit has physically left the pin.</p>
+
+<h3>1.4 Bring-up sequence</h3>
+<p>USART1 hangs off <strong>APB2</strong> and its TX pin is <strong>PA9</strong>, so port A's clock is needed too. The sequence:</p>
+
+<table>
+  <tr><th>Step</th><th>Register</th><th>Write</th></tr>
+  <tr><td>1. Clock GPIOA + USART1</td><td><code>RCC_APB2ENR</code> (0x40021018)</td><td>set bit 2 (<code>IOPAEN</code>) and bit 14 (<code>USART1EN</code>)</td></tr>
+  <tr><td>2. PA9 = AF push-pull</td><td><code>GPIOA_CRH</code> (0x40010804)</td><td>pin-9 nibble (bits[7:4]) = <code>0xB</code></td></tr>
+  <tr><td>3. Baud rate</td><td><code>USART1_BRR</code> (0x40013808)</td><td><code>0x341</code> (9600 @ 8 MHz)</td></tr>
+  <tr><td>4. Enable TX + USART</td><td><code>USART1_CR1</code> (0x4001380C)</td><td>set bit 3 (<code>TE</code>) and bit 13 (<code>UE</code>)</td></tr>
+</table>
+
+<p>Why <code>0xB</code> for PA9? The pin is driven by the peripheral, not by software, so it must be an <strong>alternate-function</strong> output. Decoding the STM32F1 4-bit field: <code>MODE = 0b11</code> (output, 50&nbsp;MHz) and <code>CNF = 0b10</code> (AF push-pull) → <code>(CNF&lt;&lt;2)|MODE = 0b1011 = 0xB</code>. (RM0041 §8.2, §9.1.11. Remember: STM32F1 has no <code>MODER</code>.)</p>
+
+<!-- ============================== SANITY CHECK ============================== -->
+<span class="section-tag">★ Early Sanity Check</span>
+<h2>2. Prove you have output BEFORE building anything</h2>
+
+<p>Before you write a driver, a string helper, or retarget <code>printf</code>, confirm the absolute minimum works: configure USART1 and push <strong>one string</strong> onto the wire. If this does not appear, nothing downstream will — so debug it here, in isolation.</p>
+
+<h3>2.1 Minimal "hello" (this one is complete on purpose)</h3>
+<p>Create <code>06-uart-transmit/hello.c</code>:</p>
+
+<pre><code>#include &lt;stdint.h&gt;
+
+#define RCC_APB2ENR  (*(volatile uint32_t *)0x40021018U)
+#define GPIOA_CRH    (*(volatile uint32_t *)0x40010804U)
+#define USART1_SR    (*(volatile uint32_t *)0x40013800U)
+#define USART1_DR    (*(volatile uint32_t *)0x40013804U)
+#define USART1_BRR   (*(volatile uint32_t *)0x40013808U)
+#define USART1_CR1   (*(volatile uint32_t *)0x4001380CU)
+
+int main(void)
+{
+    /* clock GPIOA (bit2) + USART1 (bit14) */
+    RCC_APB2ENR |= (1U &lt;&lt; 2) | (1U &lt;&lt; 14);
+
+    /* PA9 = AF push-pull 50MHz: pin-9 nibble at bits[7:4] = 0xB */
+    GPIOA_CRH = (GPIOA_CRH &amp; ~(0xFU &lt;&lt; 4)) | (0xBU &lt;&lt; 4);
+
+    USART1_BRR = 0x341U;                 /* 9600 @ 8 MHz            */
+    USART1_CR1 = (1U &lt;&lt; 3) | (1U &lt;&lt; 13);  /* TE | UE                 */
+
+    const char *msg = "hello uart\r\n";
+    while (*msg != '\0')
+    {
+        while ((USART1_SR &amp; (1U &lt;&lt; 7)) == 0U) { }  /* wait for TXE */
+        USART1_DR = (uint32_t)*msg;
+        msg++;
+    }
+
+    for (;;) { }
+    return 0;
+}</code></pre>
+
+<h3>2.2 The exact run command</h3>
+<p>From inside <code>06-uart-transmit/</code>:</p>
+<pre><code>make -f ../common/Makefile SRC=hello.c run</code></pre>
+<p>You should see <code>hello uart</code> printed on your terminal. Quit QEMU with <kbd>Ctrl-A</kbd> then <kbd>X</kbd>. If you see that line, your toolchain, board model, and USART setup are all good — proceed to the full driver.</p>
+
+<div class="box danger">
+  <span class="box-title">⚠ The 3-serial gotcha — read this if QEMU refuses to start</span>
+  <p>The <code>stm32vldiscovery</code> machine instantiates <strong>three</strong> USARTs (USART1, USART2, USART3), and QEMU insists every serial device has a backend. A bare <code>-serial stdio</code> therefore <strong>fails</strong> with:</p>
+  <pre><code>cannot use stdio by multiple character devices</code></pre>
+  <p>The fix is to give all three a backend — USART1 to your terminal, the other two to <code>null</code> (discarded):</p>
+  <pre><code>qemu-system-arm -M stm32vldiscovery -display none \
+    -serial stdio -serial null -serial null \
+    -kernel build/firmware.elf</code></pre>
+  <p>The <strong>first</strong> <code>-serial</code> maps to <strong>USART1</strong> (the one this course uses) → <code>stdio</code> = your terminal. The shared Makefile's <code>run</code> target already does exactly this, so <code>make … run</code> just works. Quit with <kbd>Ctrl-A</kbd> then <kbd>X</kbd>.</p>
+</div>
+
+<!-- ============================== EXERCISE ============================== -->
+<span class="section-tag">Guided Exercise</span>
+<h2>3. Build a driver, then retarget printf</h2>
+
+<p>Now grow the one-shot hello into reusable pieces and finish with working <code>printf</code>:</p>
+<ol>
+  <li><code>uart_init()</code> — the bring-up sequence from §1.4.</li>
+  <li><code>uart_putc()</code> — poll <code>TXE</code>, then write <code>DR</code>.</li>
+  <li><code>uart_puts()</code> — loop <code>uart_putc</code> over a string.</li>
+  <li><code>_write()</code> — the syscall newlib's <code>printf</code> calls; route it to <code>uart_putc</code>.</li>
+  <li><code>setvbuf(stdout, NULL, _IONBF, 0)</code> once, then <code>printf</code> away.</li>
+</ol>
+
+<h3>3.1 Skeleton — create <code>06-uart-transmit/main.c</code></h3>
+<p>Fill in every <code>TODO</code>. The register defines are given; the logic is yours.</p>
+
+<pre><code>#include &lt;stdint.h&gt;
+#include &lt;stdio.h&gt;      /* printf, setvbuf, _IONBF */
+
+#define RCC_APB2ENR   (*(volatile uint32_t *)0x40021018U)
+#define RCC_IOPAEN    (1U &lt;&lt; 2)
+#define RCC_USART1EN  (1U &lt;&lt; 14)
+
+#define GPIOA_CRH     (*(volatile uint32_t *)0x40010804U)
+
+#define USART1_SR     (*(volatile uint32_t *)0x40013800U)
+#define USART1_DR     (*(volatile uint32_t *)0x40013804U)
+#define USART1_BRR    (*(volatile uint32_t *)0x40013808U)
+#define USART1_CR1    (*(volatile uint32_t *)0x4001380CU)
+
+#define USART_SR_TXE  (1U &lt;&lt; 7)
+#define USART_CR1_TE  (1U &lt;&lt; 3)
+#define USART_CR1_UE  (1U &lt;&lt; 13)
+
+static void uart_init(void)
+{
+    /* TODO 1: enable clocks for GPIOA and USART1 in RCC_APB2ENR */
+
+    /* TODO 2: set PA9's nibble in CRH to 0xB (AF push-pull 50MHz).
+     *         pin-9 field is at bits[7:4]; clear then OR in 0xB. */
+
+    /* TODO 3: program USART1_BRR for 9600 baud @ 8 MHz (= 0x341) */
+
+    /* TODO 4: enable transmitter and USART: set TE and UE in CR1 */
+}
+
+static void uart_putc(uint8_t c)
+{
+    /* TODO 5: wait until TXE is set, then write c to USART1_DR */
+}
+
+static void uart_puts(const char *s)
+{
+    /* TODO 6: call uart_putc for each char until the NUL terminator */
+}
+
+/* newlib's printf calls _write(); override the nosys stub to hit the UART. */
+int _write(int fd, const char *buf, int len)
+{
+    (void)fd;
+    /* TODO 7: loop over len bytes; for each '\n' send '\r' first,
+     *         then send the byte. Return len. */
+    return len;
+}
+
+int main(void)
+{
+    uart_init();
+
+    /* TODO 8: setvbuf(stdout, NULL, _IONBF, 0);  -- unbuffered, no heap */
+
+    uart_puts("hello from uart_puts\r\n");
+
+    /* TODO 9: a couple of printf demos, e.g. an int and a hex value */
+
+    for (;;) { }
+    return 0;
+}
+</code></pre>
+
+<div class="box note">
+  <span class="box-title">Why <code>setvbuf(..., _IONBF, 0)</code>?</span>
+  It makes <code>stdout</code> <strong>unbuffered</strong> so each character is emitted immediately — and, importantly, newlib then needs <strong>no heap buffer</strong> for stdout, so no <code>malloc</code>/<code>_sbrk</code> is dragged in. That keeps the build MISRA-clean (no dynamic memory). The Makefile links <code>--specs=nano.specs</code> (newlib-nano), whose <code>printf</code> is <strong>integer-only</strong> — <code>%d</code>, <code>%u</code>, <code>%x</code>, <code>%c</code>, <code>%s</code> all work; <code>%f</code> does not. That is exactly right for register/embedded work.
+</div>
+
+<h3>3.2 Build &amp; run</h3>
+<pre><code>make -f ../common/Makefile SRC=main.c run</code></pre>
+<p>Expected output: your <code>uart_puts</code> line followed by your <code>printf</code> demos. Quit with <kbd>Ctrl-A</kbd> then <kbd>X</kbd>. Success criterion: text appears, <code>printf</code> formats integers/hex correctly, and the build is warning-free.</p>
+
+<h3>3.3 Hints</h3>
+<details class="hint">
+  <summary>Hint 1 — uart_init</summary>
+  <p>Clocks: <code>RCC_APB2ENR |= (RCC_IOPAEN | RCC_USART1EN);</code><br>
+  Pin: <code>GPIOA_CRH = (GPIOA_CRH &amp; ~(0xFU &lt;&lt; 4)) | (0xBU &lt;&lt; 4);</code><br>
+  Baud: <code>USART1_BRR = 0x341U;</code><br>
+  Enable: <code>USART1_CR1 = (USART_CR1_TE | USART_CR1_UE);</code></p>
+</details>
+<details class="hint">
+  <summary>Hint 2 — uart_putc polls TXE</summary>
+  <p>Wait, then write. QEMU sets TXE, so this loop is safe (no infinite hang as with unemulated peripherals):</p>
+  <pre><code>while ((USART1_SR &amp; USART_SR_TXE) == 0U) { }
+USART1_DR = (uint32_t)c;</code></pre>
+</details>
+<details class="hint">
+  <summary>Hint 3 — _write and the \n → \r\n translation</summary>
+  <p>A bare <code>'\n'</code> on a serial terminal moves down a line but not back to column 1. Send <code>'\r'</code> first:</p>
+  <pre><code>for (int i = 0; i &lt; len; i++) {
+    if (buf[i] == '\n') { uart_putc((uint8_t)'\r'); }
+    uart_putc((uint8_t)buf[i]);
+}
+return len;</code></pre>
+  <p>Then in <code>main</code>: <code>setvbuf(stdout, NULL, _IONBF, 0);</code> once, and now <code>printf("v=%d 0x%X\n", n, n);</code> works.</p>
+</details>
+<details class="hint">
+  <summary>Hint 4 — "_X is not implemented" linker warnings</summary>
+  <p>Pulling in <code>printf</code> makes newlib reference other syscalls (<code>_read</code>, <code>_close</code>, <code>_lseek</code>, <code>_isatty</code>, <code>_fstat</code>). The <code>nosys</code> stubs warn at link time. Provide your own trivial versions (each just returns a safe value) to silence them — see the reference solution. They are never actually exercised in a transmit-only program.</p>
+</details>
+
+<div class="box ok">
+  <span class="box-title">Reference solution</span>
+  Full, commented solution with the syscall stubs: <code>solutions/06-uart-transmit.c</code>. Try every hint first.
+</div>
+
+<!-- ============================== QUESTIONS ============================== -->
+<span class="section-tag">Verification Questions</span>
+<h2>4. Check your understanding</h2>
+
+<details class="answer">
+  <summary>Q1. QEMU prints "cannot use stdio by multiple character devices" and won't start. What's wrong, and what's the fix?</summary>
+  <p>The <code>stm32vldiscovery</code> machine has <strong>three</strong> USARTs, and QEMU requires a backend for every serial device. A single <code>-serial stdio</code> tries to attach stdio to more than one device, which is illegal. Give all three a backend — the first goes to your terminal, the rest are discarded: <code>-serial stdio -serial null -serial null</code>. The first <code>-serial</code> maps to USART1, the one this course uses. The Makefile's <code>run</code> target already does this.</p>
+</details>
+<details class="answer">
+  <summary>Q2. What is the difference between TXE and TC, and which should a byte-at-a-time driver poll?</summary>
+  <p><code>TXE</code> (TX data register empty, bit 7) sets when the byte you wrote to <code>DR</code> has moved into the shift register, so <code>DR</code> can take the <em>next</em> byte — even though the previous one is still being clocked onto the wire. <code>TC</code> (transmission complete, bit 6) sets only when the shift register has finished and the line is idle. A streaming driver polls <strong>TXE</strong> so it can refill <code>DR</code> immediately and keep the transmitter busy. You wait on <code>TC</code> only when you must guarantee the <em>last</em> bit has physically left the pin (e.g. before disabling the USART or entering a low-power sleep).</p>
+</details>
+<details class="answer">
+  <summary>Q3. Why is PA9 configured with the nibble 0xB instead of a normal push-pull output like 0x2?</summary>
+  <p>The pin must be driven by the <em>USART peripheral</em>, not by writes to the GPIO output data register. STM32F1 expresses that by selecting an <strong>alternate-function</strong> output mode in <code>CNF</code>. Decoding <code>0xB = 0b1011</code>: <code>MODE = 0b11</code> (output, 50 MHz) and <code>CNF = 0b10</code> (AF push-pull). A plain output (<code>CNF = 0b00</code>, nibble <code>0x2</code>/<code>0x3</code>) would leave the line under software control and the USART could not drive it.</p>
+</details>
+<details class="answer">
+  <summary>Q4. Why does retargeting printf only require defining _write()? And why call setvbuf with _IONBF?</summary>
+  <p>newlib's <code>printf</code> formats text into a buffer and then emits it through the single low-level syscall <code>_write(fd, buf, len)</code>. The Makefile links <code>nosys.specs</code>, which supplies a do-nothing stub <code>_write</code>; by defining our own <code>_write</code> we override it and send those bytes to the UART. Calling <code>setvbuf(stdout, NULL, _IONBF, 0)</code> makes stdout <strong>unbuffered</strong>: characters flush immediately, and — crucially — newlib then allocates no stdout buffer, so <code>malloc</code>/<code>_sbrk</code> are never pulled in. That keeps the firmware free of dynamic memory (MISRA-friendly).</p>
+</details>
+<details class="answer">
+  <summary>Q5. Your code does <code>printf("%f", x)</code> and gets nothing useful. Why?</summary>
+  <p>The build links <strong>newlib-nano</strong> (<code>--specs=nano.specs</code>), whose <code>printf</code> is <strong>integer-only</strong> to save flash — floating-point conversions like <code>%f</code> are not included. Use integer/hex/string conversions (<code>%d</code>, <code>%u</code>, <code>%x</code>, <code>%c</code>, <code>%s</code>). For fixed-point you would scale and print integers (e.g. millivolts as <code>%d</code>). Embedded code rarely needs <code>%f</code>, which is why nano omits it.</p>
+</details>
+<details class="answer">
+  <summary>Q6. Why translate '\n' into "\r\n" inside _write?</summary>
+  <p>On a serial terminal the two control characters do different things: <code>'\n'</code> (line feed) moves the cursor <em>down</em> a row, and <code>'\r'</code> (carriage return) moves it back to <em>column 1</em>. A bare <code>'\n'</code> leaves the next line starting wherever the previous one ended (a "staircase" effect). Sending <code>'\r'</code> before <code>'\n'</code> gives the expected start-of-next-line behaviour on a raw console.</p>
+</details>
+
+<div class="modfooter">
+  <a href="../05-gpio-input/05-gpio-input.html">← 05 · GPIO Input</a>
+  <a href="../07-uart-receive/07-uart-receive.html">07 · UART Receive →</a>
+</div>
+
+</div>
+</body>
+</html>

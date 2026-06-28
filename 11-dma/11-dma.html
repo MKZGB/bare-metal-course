@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>11 · DMA Driver — Bare-Metal STM32</title>
+<link rel="stylesheet" href="../common/style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <a href="../README.md">Home</a>
+  <a href="../glossary.html">Glossary</a>
+  <a href="../10-interrupts-nvic/10-interrupts-nvic.html">‹ Prev</a>
+  <a href="../12-i2c/12-i2c.html">Next ›</a>
+  <a href="11-dma-pt.html">🌐 Português</a>
+  <span class="spacer"></span>
+  <span class="badge">STM32F100RBT6 · RM0041</span>
+</nav>
+
+<div class="wrap">
+
+<h1><span class="modnum">Module 11</span> DMA — Moving Bytes Without the CPU</h1>
+<p class="subtitle">Use <strong>DMA1 Channel 4</strong> to stream a string straight into <code>USART1_DR</code> — the data mover runs while the CPU is free. Contrast this with the byte-at-a-time polled TX of Module 06.</p>
+
+<div class="box note">
+  <span class="box-title">Dependencies</span>
+  This module builds directly on <a href="../06-uart-transmit/06-uart-transmit.html">Module 06 (UART Transmit)</a> (the polled <code>uart_putc</code> driver and the <code>printf</code> retarget) and on <a href="../10-interrupts-nvic/10-interrupts-nvic.html">Module 10 (Interrupts / NVIC)</a> (the transfer-complete interrupt is wired the same way). Make sure you are comfortable with both.
+</div>
+
+<!-- ============================== THEORY ============================== -->
+<span class="section-tag">Theory</span>
+<h2>1. What DMA is, and why you want it</h2>
+
+<p>In Module 06 the CPU transmitted a string by spinning on the <code>TXE</code> flag and writing every single byte into <code>USART1_DR</code> itself:</p>
+
+<div class="diagram">Module 06 (CPU-polled TX):
+
+  for each byte:
+      CPU: while (!(USART1_SR & TXE)) { spin }   &lt;- CPU burns cycles waiting
+      CPU: USART1_DR = byte                       &lt;- CPU does the copy
+
+  The CPU is the data mover. It can do nothing else meanwhile.</div>
+
+<p><strong>D</strong>irect <strong>M</strong>emory <strong>A</strong>ccess is a separate hardware engine that moves data between memory and a peripheral (or memory↔memory) <em>without the CPU copying each byte</em>. You tell it three things — <em>where from</em>, <em>where to</em>, and <em>how many</em> — flip a switch, and it does the rest, raising an interrupt when finished.</p>
+
+<div class="diagram">Module 11 (DMA TX):
+
+  CPU (once): set source, destination, count, enable channel
+  DMA engine: byte0 -> USART1_DR, byte1 -> USART1_DR, ...   &lt;- no CPU
+  DMA engine: raises "transfer complete" when count hits 0
+
+  The DMA controller is the data mover. The CPU is free.</div>
+
+<p>This matters for high-throughput or latency-sensitive work (audio, ADC sampling, long UART/SPI bursts): the CPU sets it up and walks away.</p>
+
+<h3>1.1 Channels and DMA requests</h3>
+<p>DMA1 on the STM32F100 has <strong>7 channels</strong>. A channel is one independent transfer "stream" with its own source, destination, and count. On the STM32F1 each peripheral DMA request line is <em>hard-wired</em> to a fixed channel — you do not get to choose. From RM0041 Table&nbsp;78, <strong>USART1_TX is mapped to DMA1 Channel&nbsp;4</strong>. That is why this module uses channel&nbsp;4 specifically.</p>
+
+<h3>1.2 The per-channel register block</h3>
+<p>DMA1 lives at base <code>0x40020000</code> (it is on the <strong>AHB</strong> bus, so its clock enable is <code>RCC_AHBENR</code> bit&nbsp;0, not an APB register). It has two shared status registers followed by a block of four configuration registers <em>per channel</em>:</p>
+
+<table>
+  <tr><th>Register</th><th>Offset</th><th>Role</th></tr>
+  <tr><td><code>DMA_ISR</code></td><td><code>0x00</code></td><td>Interrupt status flags (4 per channel)</td></tr>
+  <tr><td><code>DMA_IFCR</code></td><td><code>0x04</code></td><td>Clear flags (write 1 to clear)</td></tr>
+  <tr><td><code>CCRx</code></td><td><code>0x08 + (x−1)·0x14</code></td><td>Channel configuration</td></tr>
+  <tr><td><code>CNDTRx</code></td><td>CCRx + 0x04</td><td>Number of data items to transfer</td></tr>
+  <tr><td><code>CPARx</code></td><td>CCRx + 0x08</td><td>Peripheral address</td></tr>
+  <tr><td><code>CMARx</code></td><td>CCRx + 0x0C</td><td>Memory address</td></tr>
+</table>
+
+<p>Each channel's block is <code>0x14</code> (20) bytes wide, starting at <code>0x08 + (channel − 1) × 0x14</code>. For <strong>channel 4</strong>:</p>
+
+<div class="diagram">channel base = 0x08 + (4 - 1) * 0x14 = 0x08 + 0x3C = 0x44
+
+  CCR4   = 0x40020000 + 0x44 = 0x40020044   (config)
+  CNDTR4 = 0x40020000 + 0x48 = 0x40020048   (count)
+  CPAR4  = 0x40020000 + 0x4C = 0x4002004C   (peripheral addr)
+  CMAR4  = 0x40020000 + 0x50 = 0x40020050   (memory addr)</div>
+
+<h3>1.3 The CCRx configuration bits</h3>
+<table>
+  <tr><th>Bit</th><th>Name</th><th>Meaning</th></tr>
+  <tr><td>0</td><td><code>EN</code></td><td>Channel enable. Set this LAST. CPAR/CMAR/CNDTR may only be written while EN = 0.</td></tr>
+  <tr><td>1</td><td><code>TCIE</code></td><td>Transfer-complete interrupt enable (fires the NVIC IRQ — see §1.5).</td></tr>
+  <tr><td>4</td><td><code>DIR</code></td><td>Direction. <code>1</code> = read from memory (memory → peripheral). For TX we set it.</td></tr>
+  <tr><td>5</td><td><code>CIRC</code></td><td>Circular mode (auto-reload count and restart). Off for a one-shot send.</td></tr>
+  <tr><td>7</td><td><code>MINC</code></td><td>Memory increment: bump the memory pointer after each item so we walk the buffer.</td></tr>
+  <tr><td>9:8</td><td><code>PSIZE</code></td><td>Peripheral data size (00 = 8-bit). Leave 00 for byte UART.</td></tr>
+  <tr><td>11:10</td><td><code>MSIZE</code></td><td>Memory data size (00 = 8-bit). Leave 00.</td></tr>
+  <tr><td>13:12</td><td><code>PL</code></td><td>Channel priority. Leave 00 (low) — only one channel is active here.</td></tr>
+</table>
+
+<div class="box note">
+  <span class="box-title">DIR and MINC: the two settings that matter most</span>
+  <strong>DIR=1</strong> says the source is <em>memory</em> and the destination is the <em>peripheral</em> (CPAR). <strong>MINC=1</strong> says "after each byte, advance the memory pointer" so successive bytes come from successive buffer addresses. We deliberately leave <em>peripheral</em> increment (PINC, bit 6) at 0, because <code>USART1_DR</code> is a single fixed register — every byte goes to the same address.
+</div>
+
+<h3>1.4 Wiring it to USART1</h3>
+<p>The DMA controller only moves a byte when the peripheral <em>asks</em> for one. USART1 must be told to raise a DMA request whenever its TX register is empty. That is the <code>DMAT</code> bit (bit&nbsp;7) in <code>USART1_CR3</code> (<code>0x40013814</code>). The destination address for the channel is the USART data register, <code>USART1_DR = 0x40013804</code>.</p>
+
+<div class="diagram">Setup order for a memory -> USART1_TX transfer:
+
+  1. RCC_AHBENR |= DMA1EN          enable the DMA1 clock
+  2. CCR4.EN = 0                   disable channel before configuring
+  3. CPAR4   = 0x40013804          dest = USART1_DR
+  4. CMAR4   = &amp;buffer              src  = our string in RAM
+  5. CNDTR4  = length              how many bytes
+  6. CCR4    = DIR | MINC          mem->periph, walk the buffer
+  7. USART1_CR3 |= DMAT            let USART1 issue DMA requests
+  8. CCR4.EN = 1                   GO</div>
+
+<h3>1.5 Knowing when it is done</h3>
+<p>The shared <code>DMA_ISR</code> packs four flags per channel. For channel 4 they sit in bits <code>[15:12]</code>: <code>GIF4</code>(12), <code>TCIF4</code>(13), <code>HTIF4</code>(14), <code>TEIF4</code>(15). <strong><code>TCIF4</code> (transfer complete, bit 13)</strong> sets when <code>CNDTR4</code> reaches 0. You either poll it or, with <code>CCR4.TCIE</code> set, take the <strong>DMA1_Channel4 interrupt (IRQ 14)</strong> via the NVIC (Module 10). You clear the flag by writing 1 to the matching bit in <code>DMA_IFCR</code>.</p>
+
+<div class="box danger">
+  <span class="box-title">⚠ QEMU does NOT emulate DMA — read this before you write a wait loop</span>
+  Per the verified emulation matrix, <code>qemu-system-arm -M stm32vldiscovery</code> <strong>does not emulate the DMA controller at all</strong>. No transfer ever happens: the bytes in your buffer <em>never</em> reach <code>USART1_DR</code>, the DMA-sent string <em>does not appear</em> on the console, and <strong><code>TCIF4</code> is NEVER set</strong>.
+  <br><br>
+  Therefore a naive <code>while (!(DMA_ISR &amp; TCIF4)) { }</code> would <strong>hang forever in QEMU</strong>. You must use a <strong>bounded wait</strong> (a guard counter) so the program completes and you can print an explanation. On real STM32 hardware the very same register code transmits the string correctly and <code>TCIF4</code> sets.
+</div>
+
+<div class="box warn">
+  <span class="box-title">How we still get something observable</span>
+  Since the DMA path produces no visible output in QEMU, <code>main()</code> first prints a banner using the <em>CPU-polled</em> <code>uart_putc</code>/<code>printf</code> from Module 06 (USART1 itself <em>is</em> fully emulated). It explains exactly what registers were programmed, then configures DMA, then bounded-waits on <code>TCIF4</code> and prints the QEMU-limitation note. So you see the program <em>run to completion</em> and reason about the DMA setup, without depending on a transfer QEMU can't perform.
+</div>
+
+<!-- ============================== EXERCISE ============================== -->
+<span class="section-tag">Guided Exercise</span>
+<h2>2. Transmit a string with DMA1 Channel 4</h2>
+
+<p><strong>Goal:</strong> reuse the Module 06 polled driver for an explanatory banner, then set up DMA1 Channel 4 to stream a static string into <code>USART1_DR</code>, and finish with a <em>bounded</em> wait on <code>TCIF4</code>. You will:</p>
+<ol>
+  <li>Enable the DMA1 clock in <code>RCC_AHBENR</code> (bit 0, the AHB bus).</li>
+  <li>Program <code>CPAR4</code> (= <code>USART1_DR</code>), <code>CMAR4</code> (= buffer), <code>CNDTR4</code> (= length).</li>
+  <li>Set <code>CCR4</code> bits <code>DIR</code> and <code>MINC</code>, then enable USART1 <code>DMAT</code>, then set <code>CCR4.EN</code>.</li>
+  <li>Bounded-wait on <code>TCIF4</code> and print the outcome (it will time out in QEMU — expected).</li>
+</ol>
+
+<h3>2.1 Skeleton — create <code>11-dma/main.c</code></h3>
+<p>Fill in every <code>TODO</code>. The polled <code>uart_init</code> / <code>uart_putc</code> / <code>_write</code> / syscall-stub block is identical to Module 06 — copy yours in. Only the DMA parts are shown below.</p>
+
+<pre><code>#include &lt;stdint.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;sys/stat.h&gt;
+
+/* --- Reuse from Module 06: uart_init(), uart_putc(), _write(), and the
+ *     newlib syscall stubs (_read/_close/_lseek/_isatty/_fstat).
+ *     They give us a working printf over the CPU-polled TX path. --- */
+
+/* ---- RCC ---- */
+#define RCC_AHBENR    (*(volatile uint32_t *)0x40021014U)
+#define RCC_DMA1EN    (1U &lt;&lt; 0)
+
+/* ---- USART1 (CR3.DMAT lets USART1 raise DMA requests) ---- */
+#define USART1_CR3     (*(volatile uint32_t *)0x40013814U)
+#define USART_CR3_DMAT (1U &lt;&lt; 7)
+#define USART1_DR_ADDR (0x40013804U)   /* DMA destination */
+
+/* ---- DMA1 (base 0x40020000) ---- */
+#define DMA1_ISR      (*(volatile uint32_t *)0x40020000U)
+#define DMA1_IFCR     (*(volatile uint32_t *)0x40020004U)
+/* TODO A: define CCR4, CNDTR4, CPAR4, CMAR4 from the channel-4 base.
+ *         channel base = 0x08 + (4-1)*0x14 = 0x44, so CCR4 is at
+ *         0x40020000 + 0x44. The next three follow at +4, +8, +0xC. */
+
+#define DMA_CCR_EN    (1U &lt;&lt; 0)
+#define DMA_CCR_DIR   (1U &lt;&lt; 4)   /* 1 = read from memory  */
+#define DMA_CCR_MINC  (1U &lt;&lt; 7)   /* memory increment      */
+#define DMA_ISR_TCIF4   (1U &lt;&lt; 13)
+#define DMA_IFCR_CTCIF4 (1U &lt;&lt; 13)
+
+static const char dma_message[] = "Hello via DMA1 Channel 4 -&gt; USART1_TX\r\n";
+
+static void dma_uart_tx_start(const char *buf, uint16_t len)
+{
+    /* 1. Enable the DMA1 clock (AHB bus). */
+    RCC_AHBENR |= RCC_DMA1EN;
+
+    /* 2. Disable the channel before (re)configuring it. */
+    DMA1_CCR4 &amp;= ~DMA_CCR_EN;
+
+    /* TODO B: CPAR4 = the USART1 data register address (USART1_DR_ADDR). */
+
+    /* TODO C: CMAR4 = the buffer address (cast buf to uint32_t). */
+
+    /* TODO D: CNDTR4 = the number of bytes to send (len). */
+
+    /* TODO E: CCR4 = DIR | MINC  (mem-&gt;periph, increment memory pointer). */
+
+    /* TODO F: set USART1_CR3 DMAT bit so USART1 issues DMA requests. */
+
+    /* TODO G: finally set CCR4.EN to start the transfer. */
+}
+
+int main(void)
+{
+    uint32_t guard;
+    uint16_t len;
+
+    uart_init();
+    (void)setvbuf(stdout, NULL, _IONBF, 0);
+
+    printf("\r\n=== Module 11: DMA Driver (UART TX) ===\n");
+    printf("This banner is sent by the CPU (polled), like Module 06.\n");
+    printf("Now configuring DMA1 Channel 4...\n");
+
+    len = (uint16_t)(sizeof(dma_message) - 1U);
+    dma_uart_tx_start(dma_message, len);
+
+    /* BOUNDED wait: TCIF4 never sets in QEMU, so a plain while() would HANG.
+     * The guard makes the program finish so we can explain what happened. */
+    guard = 1000000U;
+    while (((DMA1_ISR &amp; DMA_ISR_TCIF4) == 0U) &amp;&amp; (guard &gt; 0U))
+    {
+        guard--;
+    }
+
+    if (guard == 0U)
+    {
+        printf("Result: transfer did not complete - DMA not emulated by QEMU;\n");
+        printf("        correct on hardware.\n");
+    }
+    else
+    {
+        DMA1_IFCR = DMA_IFCR_CTCIF4;   /* clear the flag on real HW */
+        printf("Result: DMA transfer complete (TCIF4 set).\n");
+    }
+
+    for (;;) { }
+    return 0;
+}
+</code></pre>
+
+<h3>2.2 Build &amp; run</h3>
+<p>From inside the <code>11-dma/</code> folder:</p>
+<pre><code>make -f ../common/Makefile SRC=main.c run</code></pre>
+<p>You should see the banner and the register summary, then <code>"transfer did not complete - DMA not emulated by QEMU"</code>, then <code>=== done ===</code>. Crucially the program <strong>does not hang</strong> — the bounded wait expires and execution continues. Quit QEMU with <kbd>Ctrl-A</kbd> then <kbd>X</kbd>. Success criterion: builds with <strong>no warnings</strong>, prints the banner, and reaches the idle loop without freezing.</p>
+
+<h3>2.3 Hints</h3>
+<details class="hint">
+  <summary>Hint 1 — computing the channel-4 register addresses (TODO A)</summary>
+  <p>Channel base offset is <code>0x08 + (4−1)·0x14 = 0x44</code>. So:
+  <code>CCR4 @ 0x40020044</code>, <code>CNDTR4 @ 0x40020048</code>, <code>CPAR4 @ 0x4002004C</code>, <code>CMAR4 @ 0x40020050</code>. For example:
+  <code>#define DMA1_CCR4 (*(volatile uint32_t *)0x40020044U)</code> and the other three at +4/+8/+0xC.</p>
+</details>
+<details class="hint">
+  <summary>Hint 2 — addresses and count (TODO B/C/D)</summary>
+  <p><code>DMA1_CPAR4 = USART1_DR_ADDR;</code> (the fixed peripheral register). <code>DMA1_CMAR4 = (uint32_t)buf;</code> (the start of your string). <code>DMA1_CNDTR4 = (uint32_t)len;</code> (bytes to move — exclude the terminating NUL).</p>
+</details>
+<details class="hint">
+  <summary>Hint 3 — direction / increment and the start sequence (TODO E/F/G)</summary>
+  <p>Write the config in one go: <code>DMA1_CCR4 = (DMA_CCR_DIR | DMA_CCR_MINC);</code> — DIR=1 means memory→peripheral, MINC=1 walks the buffer; leave PSIZE/MSIZE/PL at 0 (8-bit, low priority), and do NOT set PINC since <code>USART1_DR</code> is fixed. Then <code>USART1_CR3 |= USART_CR3_DMAT;</code> and finally <code>DMA1_CCR4 |= DMA_CCR_EN;</code>. Order matters: configure everything <em>while EN=0</em>, set EN last.</p>
+</details>
+<details class="hint">
+  <summary>Hint 4 — why the bounded wait, not a normal flag poll</summary>
+  <p>QEMU never sets <code>TCIF4</code>, so <code>while(!(DMA1_ISR &amp; DMA_ISR_TCIF4)){}</code> spins forever. The guard counter forces the loop to exit after a fixed number of iterations so the program completes and prints the QEMU note. On real hardware the flag sets first and the loop exits early.</p>
+</details>
+
+<div class="box ok">
+  <span class="box-title">Reference solution</span>
+  Full, commented solution: <code>solutions/11-dma.c</code>. Try every hint first.
+</div>
+
+<!-- ============================== QUESTIONS ============================== -->
+<span class="section-tag">Verification Questions</span>
+<h2>3. Check your understanding</h2>
+
+<details class="answer">
+  <summary>Q1. How does DMA offload the CPU compared with Module 06's polled TX?</summary>
+  <p>In Module 06 the CPU was the data mover: for every byte it spun on <code>TXE</code> and wrote <code>USART1_DR</code> itself, so it could do nothing else during the transfer. With DMA the CPU configures source/destination/count <em>once</em> and enables the channel; the DMA engine then copies each byte (triggered by the USART's TX-empty DMA request) with zero CPU involvement, and only signals the CPU via <code>TCIF4</code>/the IRQ when finished. The CPU is free to run other code meanwhile.</p>
+</details>
+<details class="answer">
+  <summary>Q2. Compute the four channel-4 register addresses from the DMA1 base.</summary>
+  <p>Channel base offset = <code>0x08 + (4−1)·0x14 = 0x08 + 0x3C = 0x44</code>. Adding the DMA1 base <code>0x40020000</code>:
+  <code>CCR4 = 0x40020044</code>, <code>CNDTR4 = 0x40020048</code>, <code>CPAR4 = 0x4002004C</code>, <code>CMAR4 = 0x40020050</code>. The shared <code>DMA_ISR</code> (0x40020000) and <code>DMA_IFCR</code> (0x40020004) sit before the channel blocks.</p>
+</details>
+<details class="answer">
+  <summary>Q3. What are the roles of the DIR and MINC bits for a UART TX transfer?</summary>
+  <p><code>DIR=1</code> sets the transfer direction to "read from memory" — source = memory (<code>CMAR</code>), destination = peripheral (<code>CPAR</code>). <code>MINC=1</code> increments the <em>memory</em> address after each item so successive bytes are fetched from successive buffer locations. We leave peripheral increment (PINC) off because every byte is written to the same fixed register, <code>USART1_DR</code>.</p>
+</details>
+<details class="answer">
+  <summary>Q4. Which flag signals completion, where does it live, and how do you clear it?</summary>
+  <p><code>TCIF4</code> (transfer complete for channel 4) — bit 13 of the shared <code>DMA_ISR</code> (channel-4 flags occupy bits [15:12]). It sets when <code>CNDTR4</code> counts down to 0. You clear it by writing 1 to the corresponding bit in <code>DMA_IFCR</code> (<code>CTCIF4</code>, bit 13). If <code>CCR4.TCIE</code> is set, the same event also raises the NVIC <code>DMA1_Channel4</code> interrupt, IRQ 14.</p>
+</details>
+<details class="answer">
+  <summary>Q5. You run it in QEMU and the DMA string never appears, and a plain <code>while(!(ISR&amp;TCIF4)){}</code> hangs. Why, and what's the fix?</summary>
+  <p>QEMU's <code>stm32vldiscovery</code> machine does not emulate the DMA controller, so no transfer occurs, the bytes never reach <code>USART1_DR</code>, and <code>TCIF4</code> is never set — the unbounded loop would wait forever. The fix is a <strong>bounded wait</strong>: a guard counter that forces the loop to exit, after which you print an explanation. The register code is still correct and works on real STM32 hardware. (This is the same "QEMU doesn't emulate it" honesty as the GPIO, timer, and I2C modules.)</p>
+</details>
+
+<div class="modfooter">
+  <a href="../10-interrupts-nvic/10-interrupts-nvic.html">← 10 · Interrupts &amp; NVIC</a>
+  <a href="../12-i2c/12-i2c.html">12 · I2C →</a>
+</div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 · Receção UART — Bare-Metal STM32</title>
+<link rel="stylesheet" href="../common/style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <a href="../README-pt.md">Início</a>
+  <a href="../glossary-pt.html">Glossário</a>
+  <a href="../06-uart-transmit/06-uart-transmit-pt.html">‹ Anterior</a>
+  <a href="../08-systick-timer/08-systick-timer-pt.html">Seguinte ›</a>
+  <a href="07-uart-receive.html">🌐 English</a>
+  <span class="spacer"></span>
+  <span class="badge">STM32F100RBT6 · RM0041</span>
+</nav>
+
+<div class="wrap">
+
+<h1><span class="modnum">Módulo 07</span> Receção UART — Ler Bytes de Volta</h1>
+<p class="subtitle">Ativa o <em>recetor</em> do USART1 em <code>PA10</code>, sonda a flag <code>RXNE</code> e lê os bytes recebidos a partir de <code>DR</code>. Constrói um ciclo de <strong>eco</strong> série que podes mesmo controlar a partir do teclado no QEMU.</p>
+
+<div class="box note">
+  <span class="box-title">Dependências</span>
+  Completa primeiro o <a href="../06-uart-transmit/06-uart-transmit-pt.html">Módulo 06 (Transmissão UART)</a>. Este módulo reutiliza <code>uart_init</code>, <code>uart_putc</code> e <code>uart_puts</code> de lá e apenas acrescenta o caminho de <strong>receção</strong>. Se ainda não tens o TX a imprimir no QEMU, resolve isso antes de continuar — o ciclo de eco reenvia cada byte recebido com <code>uart_putc</code>.
+</div>
+
+<!-- ============================== THEORY ============================== -->
+<span class="section-tag">Teoria</span>
+<h2>1. Como o USART recebe um byte</h2>
+
+<p>Transmitir (Módulo 06) e receber são duas metades independentes do mesmo periférico. O recetor observa continuamente a linha RX, amostra os bits de cada trama recebida e reagrupa-os num byte. Quando um byte completo está pronto, o hardware copia-o para o <strong>registo de dados</strong> <code>DR</code> e levanta uma flag de estado para que o teu código saiba que o deve recolher.</p>
+
+<p>Essa flag é a <strong><code>RXNE</code></strong> — "Read data register Not Empty", <code>USART_SR</code> bit&nbsp;5 (RM0041 §27.6.1). A imagem espelhada da <code>TXE</code> do lado da transmissão:</p>
+
+<table>
+  <tr><th>Flag</th><th>Bit do SR</th><th>Ativada quando…</th><th>Limpa por…</th></tr>
+  <tr><td><code>TXE</code> (transmissão)</td><td>7</td><td>DR está vazio, pronto para um novo byte a enviar</td><td>escrever o byte seguinte em <code>DR</code></td></tr>
+  <tr><td><code>RXNE</code> (receção)</td><td>5</td><td>um byte recebido está à espera em DR</td><td><strong>ler</strong> <code>DR</code></td></tr>
+</table>
+
+<h3>1.1 Ler DR limpa RXNE</h3>
+<p>Esta é a ideia central do módulo. <strong>Não</strong> limpas <code>RXNE</code> escrevendo de volta no registo de estado. Em vez disso, o simples ato de <em>ler</em> <code>USART_DR</code> dá-te o byte <em>e</em> confirma-o, fazendo a <code>RXNE</code> voltar a 0 para que o recetor fique armado para o byte seguinte. Uma leitura = "já o recolhi."</p>
+
+<div class="diagram">Receção por sondagem — o handshake do RXNE
+
+   linha em repouso ──► byte chega ──► hardware coloca RXNE=1, carrega DR
+                                          │
+        o teu código: while(!(SR & RXNE)) {} │  (gira até ficar ativa)
+                                          ▼
+                  lê x = USART_DR  ──►  devolve byte, RXNE auto-limpa →0
+                                          │
+                            pronto para o byte seguinte</div>
+
+<h3>1.2 Overrun (ORE)</h3>
+<p>Se um segundo byte chegar antes de teres lido o primeiro de <code>DR</code>, o novo byte não pode ser armazenado — o antigo perder-se-ia. O hardware sinaliza isto como um <strong>overrun</strong>: <code>ORE</code> (<code>USART_SR</code> bit&nbsp;3). Num ciclo por sondagem evitas overruns lendo <code>DR</code> prontamente. A ORE é limpa pela sequência documentada de ler <code>SR</code> e depois <code>DR</code> (RM0041 §27.6.1). Para este eco simples lemos suficientemente depressa para que a ORE raramente importe, mas um controlador robusto verifica-a. O desenho orientado a interrupções no Módulo&nbsp;10 torna o overrun muito menos provável porque a CPU é notificada no instante em que um byte chega.</p>
+
+<h3>1.3 Receção por sondagem vs por interrupção</h3>
+<p>O que fazemos aqui é receção por <strong>sondagem</strong> (programmed-I/O): a CPU fica num ciclo a testar <code>RXNE</code> e não faz mais nada até chegar um byte. Simples e perfeitamente adequado para uma demonstração de eco, mas <em>bloqueia</em> — a CPU não pode fazer outro trabalho enquanto espera. A alternativa é a receção <strong>orientada a interrupções</strong>: ativa <code>RXNEIE</code> (<code>CR1</code> bit&nbsp;5), ativa a IRQ do USART1 no NVIC, e deixa o hardware chamar um tratador de interrupção no momento em que um byte chega. A CPU executa outro código entretanto. Isso é o <a href="../10-interrupts-nvic/10-interrupts-nvic-pt.html">Módulo&nbsp;10</a>; aqui ficamos pelo estilo mais simples por sondagem.</p>
+
+<h2>2. Configuração de pino e registos (RX acrescentado ao TX)</h2>
+
+<p>O Módulo 06 já configurou <code>PA9</code> como pino de TX e ativou <code>TE</code>. A receção acrescenta exatamente duas coisas:</p>
+
+<ol>
+  <li>Configurar <strong><code>PA10</code> como pino de entrada flutuante</strong> em <code>GPIOA_CRH</code> — nibble <code>0x4</code>.</li>
+  <li>Definir o bit <strong><code>RE</code></strong> (<code>CR1</code> bit&nbsp;2) em adição a <code>TE</code> e <code>UE</code>.</li>
+</ol>
+
+<p><code>PA9</code> e <code>PA10</code> residem ambos em <code>CRH</code> (que cobre os pinos 8–15). Os seus campos de 4 bits:</p>
+
+<div class="diagram">GPIOA_CRH — PA9 (TX) e PA10 (RX)
+
+   campo PA9  no bit (9 -8)*4 = 4   → nibble 0xB = 1011 (MODE=11 out50MHz, CNF=10 AF push-pull)
+   campo PA10 no bit (10-8)*4 = 8   → nibble 0x4 = 0100 (MODE=00 input,    CNF=01 floating)
+
+   bit:  ...15 14 13 12 | 11 10  9  8 | 7  6  5  4 | 3  2  1  0
+   pin:  ...   pin11    |   pin10     |   pin9     |   pin8
+                 RX nibble 0x4 ──^^^^   ^^^^── TX nibble 0xB</div>
+
+<p>O RX é uma simples <em>entrada flutuante</em> (a linha UART em repouso é mantida em nível alto pelo transmissor na outra ponta, por isso não é necessária nenhuma resistência interna). Os bits relevantes:</p>
+
+<table>
+  <tr><th>Registo</th><th>Endereço</th><th>O que definir</th></tr>
+  <tr><td><code>RCC_APB2ENR</code></td><td><code>0x40021018</code></td><td>bit&nbsp;2 IOPAEN, bit&nbsp;14 USART1EN</td></tr>
+  <tr><td><code>GPIOA_CRH</code></td><td><code>0x40010804</code></td><td>PA9 nibble <code>0xB</code>, PA10 nibble <code>0x4</code></td></tr>
+  <tr><td><code>USART1_SR</code></td><td><code>0x40013800</code></td><td>ler bit&nbsp;5 RXNE, bit&nbsp;7 TXE</td></tr>
+  <tr><td><code>USART1_DR</code></td><td><code>0x40013804</code></td><td>ler para receber / escrever para enviar</td></tr>
+  <tr><td><code>USART1_BRR</code></td><td><code>0x40013808</code></td><td><code>0x0341</code> = 9600 baud @ 8 MHz</td></tr>
+  <tr><td><code>USART1_CR1</code></td><td><code>0x4001380C</code></td><td>bit&nbsp;2 RE, bit&nbsp;3 TE, bit&nbsp;13 UE</td></tr>
+</table>
+
+<div class="box ok">
+  <span class="box-title">Este módulo É verificável no QEMU</span>
+  Ao contrário do GPIO, temporizadores, I2C ou DMA, a máquina <code>stm32vldiscovery</code> do QEMU <strong>emula totalmente o recetor do USART</strong>. Com o comando de execução padrão, o RX do USART1 está ligado ao <strong>stdin</strong>: tudo o que escreveres no terminal (ou que canalizes para o QEMU) chega ao recetor e ativa a <code>RXNE</code>. Por isso o teu ciclo de eco faz mesmo eco — sem adivinhar leituras de registos desta vez.
+</div>
+
+<!-- ============================== EXERCISE ============================== -->
+<span class="section-tag">Exercício Guiado</span>
+<h2>3. Construir um ciclo de eco série</h2>
+
+<p><strong>Objetivo:</strong> inicializar o USART1 para TX e RX, imprimir um prompt de uma linha e depois repetir para sempre: ler um byte com <code>uart_getc</code> e reenviá-lo diretamente com <code>uart_putc</code>. Num retorno de carro (<code>'\r'</code>, o que a tecla Enter envia) emitir também um <code>'\n'</code> para que o cursor passe para uma linha nova. Vais:</p>
+<ol>
+  <li>Estender <code>uart_init</code> para configurar <code>PA10</code> (entrada flutuante) e definir <code>RE</code> juntamente com <code>TE</code>/<code>UE</code>.</li>
+  <li>Escrever <code>uart_getc</code>: sondar <code>RXNE</code>, depois ler e devolver <code>DR</code>.</li>
+  <li>Escrever o ciclo de eco em <code>main</code>.</li>
+</ol>
+
+<h3>3.1 Esqueleto — criar <code>07-uart-receive/main.c</code></h3>
+<p>Preenche cada <code>TODO</code>. Não olhes para a solução de referência até teres tentado as pistas.</p>
+
+<pre><code>#include &lt;stdint.h&gt;
+
+/* ---- Definições de registos ---------------------------------------------- */
+#define RCC_APB2ENR   (*(volatile uint32_t *)0x40021018U)
+#define GPIOA_CRH     (*(volatile uint32_t *)0x40010804U)
+#define USART1_SR     (*(volatile uint32_t *)0x40013800U)
+#define USART1_DR     (*(volatile uint32_t *)0x40013804U)
+#define USART1_BRR    (*(volatile uint32_t *)0x40013808U)
+#define USART1_CR1    (*(volatile uint32_t *)0x4001380CU)
+
+#define RCC_IOPAEN    (1U &lt;&lt; 2)
+#define RCC_USART1EN  (1U &lt;&lt; 14)
+
+#define USART_SR_RXNE (1U &lt;&lt; 5)    /* dados recebidos prontos */
+#define USART_SR_TXE  (1U &lt;&lt; 7)    /* reg dados TX vazio       */
+
+#define USART_CR1_RE  (1U &lt;&lt; 2)    /* ativar recetor           */
+#define USART_CR1_TE  (1U &lt;&lt; 3)    /* ativar transmissor       */
+#define USART_CR1_UE  (1U &lt;&lt; 13)   /* ativar USART             */
+
+#define USART1_BRR_9600  (0x0341U) /* 9600 baud @ 8 MHz    */
+
+static void uart_init(void)
+{
+    /* Relógio para GPIOA + USART1 */
+    RCC_APB2ENR |= (RCC_IOPAEN | RCC_USART1EN);
+
+    /* TODO 1: configura CRH para PA9 = AF push-pull (nibble 0xB, bits[7:4])
+     *         E PA10 = entrada flutuante (nibble 0x4, bits[11:8]).
+     *         Limpa ambos os nibbles, depois faz OR com os dois valores. */
+
+    USART1_BRR = USART1_BRR_9600;
+
+    /* TODO 2: ativa transmissor, RECETOR e o USART:
+     *         define TE | RE | UE em CR1. (RE é o bit novo deste módulo.) */
+}
+
+static void uart_putc(uint8_t c)
+{
+    while ((USART1_SR &amp; USART_SR_TXE) == 0U) { }
+    USART1_DR = (uint32_t)c;
+}
+
+static uint8_t uart_getc(void)
+{
+    /* TODO 3: sonda até RXNE estar ativa, depois lê DR e devolve os 8 bits baixos.
+     *         Ler DR é o que limpa RXNE - não é necessária escrita extra. */
+    return 0U; /* substituir */
+}
+
+int main(void)
+{
+    uint8_t c;
+
+    uart_init();
+
+    /* prompt (envia uma string curta; reutiliza o teu uart_puts do Módulo 06) */
+
+    for (;;)
+    {
+        /* TODO 4: c = uart_getc();  depois faz eco de c com uart_putc(c).
+         *         Se c == '\r', faz também uart_putc('\n'). */
+    }
+
+    return 0;
+}
+</code></pre>
+
+<h3>3.2 Compilar &amp; executar — escreve para dentro</h3>
+<p>De dentro da pasta <code>07-uart-receive/</code>:</p>
+<pre><code>make -f ../common/Makefile SRC=main.c run</code></pre>
+<p>O QEMU liga o USART1 ao teu terminal. Depois de o prompt ser impresso, <strong>escreve</strong> alguns caracteres e prime Enter — cada caractere aparece porque o teu programa faz eco dele de volta. (O próprio terminal não faz eco do que o QEMU recebe; o que vês é o teu próprio ciclo de eco em ação.) Sai com <kbd>Ctrl-A</kbd> seguido de <kbd>X</kbd>.</p>
+
+<h3>3.3 Compilar &amp; executar — canalizar entrada (não interativo)</h3>
+<p>Também podes alimentar a entrada a partir do stdin sem escrever, o que é prático para testes em scripts:</p>
+<pre><code>printf 'hello\r' | qemu-system-arm -M stm32vldiscovery -display none \
+    -serial stdio -serial null -serial null -kernel build/firmware.elf</code></pre>
+<p>Os bytes <code>h e l l o</code> chegam ao RX do USART1, ativam a <code>RXNE</code> um de cada vez, e o teu ciclo faz eco deles — por isso <code>hello</code> aparece no stdout, seguido da nova linha despoletada por <code>'\r'</code>.</p>
+
+<div class="box note">
+  <span class="box-title">De onde vem a entrada?</span>
+  A entrada chega no <strong>stdin</strong> do processo QEMU. Interativamente isso é o teu teclado; num pipe é o que quer que tenhas canalizado. O QEMU encaminha o primeiro backend <code>-serial stdio</code> para o USART1, por isso stdin → USART1 RX e USART1 TX → stdout.
+</div>
+
+<h3>3.4 Pistas</h3>
+<details class="hint">
+  <summary>Pista 1 — configurar PA9 e PA10 juntos em CRH</summary>
+  <p>O campo de PA9 começa no bit <code>(9-8)*4 = 4</code>; o de PA10 no <code>(10-8)*4 = 8</code>. Limpa ambos, depois define ambos:</p>
+  <p><code>GPIOA_CRH = (GPIOA_CRH &amp; ~((0xFU&lt;&lt;4) | (0xFU&lt;&lt;8))) | (0xBU&lt;&lt;4) | (0x4U&lt;&lt;8);</code></p>
+  <p><code>0xB</code> = AF push-pull 50&nbsp;MHz (TX); <code>0x4</code> = entrada flutuante (RX).</p>
+</details>
+<details class="hint">
+  <summary>Pista 2 — ativar o recetor</summary>
+  <p>A única diferença em relação à init só-de-TX é o bit <code>RE</code> extra:
+  <code>USART1_CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;</code> Sem <code>RE</code> o hardware de receção fica desligado e a <code>RXNE</code> nunca ativa.</p>
+</details>
+<details class="hint">
+  <summary>Pista 3 — uart_getc: sondar e depois ler</summary>
+  <p>Espelha <code>uart_putc</code> mas espera pela flag de receção, depois lê DR:</p>
+  <p><code>while ((USART1_SR &amp; USART_SR_RXNE) == 0U) { }</code><br>
+     <code>return (uint8_t)(USART1_DR &amp; 0xFFU);</code></p>
+  <p>A leitura de <code>USART1_DR</code> limpa <code>RXNE</code> como efeito secundário — não escrevas SR para a limpar.</p>
+</details>
+<details class="hint">
+  <summary>Pista 4 — o ciclo de eco e o toque '\r' → '\n'</summary>
+  <p><code>c = uart_getc(); uart_putc(c); if (c == (uint8_t)'\r') { uart_putc((uint8_t)'\n'); }</code> O terminal envia <code>'\r'</code> quando primes Enter; emitir também <code>'\n'</code> faz o cursor descer para uma linha nova e limpa.</p>
+</details>
+
+<div class="box ok">
+  <span class="box-title">Solução de referência</span>
+  Solução completa e comentada (com um <code>uart_puts</code> reutilizável e um <code>_write</code> da newlib para <code>printf</code>): <code>solutions/07-uart-receive.c</code>. Tenta primeiro todas as pistas.
+</div>
+
+<!-- ============================== QUESTIONS ============================== -->
+<span class="section-tag">Perguntas de Verificação</span>
+<h2>4. Verifica a tua compreensão</h2>
+
+<details class="answer">
+  <summary>P1. O que significa a flag <code>RXNE</code> e qual é o bit do SR?</summary>
+  <p><code>RXNE</code> = "Read data register Not Empty", <code>USART_SR</code> bit&nbsp;5. O hardware ativa-a quando um byte recebido completo foi movido para <code>DR</code> e está à espera de ser lido pelo programa. É a contraparte, do lado da receção, da <code>TXE</code> (bit&nbsp;7) do lado da transmissão.</p>
+</details>
+<details class="answer">
+  <summary>P2. Como se limpa a <code>RXNE</code> depois de um byte chegar?</summary>
+  <p><strong>Lendo</strong> <code>USART_DR</code>. Essa única leitura devolve o byte recebido <em>e</em> limpa a <code>RXNE</code> automaticamente, rearmando o recetor. Nunca escreves no SR para a limpar — ler DR é a confirmação.</p>
+</details>
+<details class="answer">
+  <summary>P3. O que é um overrun (<code>ORE</code>) e quando acontece?</summary>
+  <p>Um overrun ocorre quando um novo byte acaba de chegar antes de o anterior ter sido lido de <code>DR</code>. Não há onde pôr o novo byte sem perder o antigo, por isso o hardware ativa a <code>ORE</code> (<code>USART_SR</code> bit&nbsp;3) e os dados perdem-se. Num ciclo por sondagem evita-lo lendo <code>DR</code> prontamente; a <code>ORE</code> é limpa lendo <code>SR</code> e depois <code>DR</code>. A receção orientada a interrupções (Módulo 10) reduz o risco porque a CPU é notificada no momento em que um byte chega.</p>
+</details>
+<details class="answer">
+  <summary>P4. Qual é a diferença entre receção por sondagem e orientada a interrupções?</summary>
+  <p><strong>Por sondagem:</strong> a CPU gira num ciclo a testar <code>RXNE</code> e não faz mais nada até chegar um byte — simples, mas bloqueia a CPU. <strong>Orientada a interrupções:</strong> defines <code>RXNEIE</code> (<code>CR1</code> bit&nbsp;5) e ativas a IRQ do USART1 no NVIC; o hardware chama um tratador no instante em que um byte chega, libertando a CPU para fazer outro trabalho entretanto. Este módulo usa sondagem; o Módulo 10 cobre interrupções.</p>
+</details>
+<details class="answer">
+  <summary>P5. Porque é que o eco funciona no QEMU quando o GPIO não funcionava?</summary>
+  <p>A máquina <code>stm32vldiscovery</code> do QEMU emula totalmente o USART, incluindo o recetor, enquanto não emula GPIO de todo. Com <code>-serial stdio</code>, o RX do USART1 está ligado ao stdin do processo, por isso bytes escritos ou canalizados ativam mesmo a <code>RXNE</code> e o teu código pode lê-los. É por isso que este é o primeiro módulo cujo caminho de <em>entrada</em> é diretamente testável no emulador.</p>
+</details>
+
+<details class="answer">
+  <summary>P6. Porquê configurar PA10 como entrada <em>flutuante</em> em vez de com uma resistência de pull?</summary>
+  <p>Uma linha UART em repouso é levada a nível alto pelo transmissor na outra ponta, por isso o recetor não precisa de um pull-up ou pull-down interno para definir o nível de repouso — acrescentar um apenas lutaria contra o driver da linha. Flutuante (CNF=01, nibble <code>0x4</code>) é a escolha correta e mais simples para uma ligação UART push-pull padrão.</p>
+</details>
+
+<div class="modfooter">
+  <a href="../06-uart-transmit/06-uart-transmit-pt.html">← 06 · Transmissão UART</a>
+  <a href="../08-systick-timer/08-systick-timer-pt.html">08 · Temporizador SysTick →</a>
+</div>
+
+</div>
+</body>
+</html>

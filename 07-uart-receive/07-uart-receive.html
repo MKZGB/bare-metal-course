@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 · UART Receive — Bare-Metal STM32</title>
+<link rel="stylesheet" href="../common/style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <a href="../README.md">Home</a>
+  <a href="../glossary.html">Glossary</a>
+  <a href="../06-uart-transmit/06-uart-transmit.html">‹ Prev</a>
+  <a href="../08-systick-timer/08-systick-timer.html">Next ›</a>
+  <a href="07-uart-receive-pt.html">🌐 Português</a>
+  <span class="spacer"></span>
+  <span class="badge">STM32F100RBT6 · RM0041</span>
+</nav>
+
+<div class="wrap">
+
+<h1><span class="modnum">Module 07</span> UART Receive — Reading Bytes Back</h1>
+<p class="subtitle">Enable the USART1 <em>receiver</em> on <code>PA10</code>, poll the <code>RXNE</code> flag, and read incoming bytes from <code>DR</code>. Build a serial <strong>echo</strong> loop you can actually drive from your keyboard in QEMU.</p>
+
+<div class="box note">
+  <span class="box-title">Dependencies</span>
+  Complete <a href="../06-uart-transmit/06-uart-transmit.html">Module 06 (UART Transmit)</a> first. This module reuses <code>uart_init</code>, <code>uart_putc</code>, and <code>uart_puts</code> from there and only adds the <strong>receive</strong> path. If you have not yet got TX printing in QEMU, fix that before continuing — the echo loop sends every received byte back out with <code>uart_putc</code>.
+</div>
+
+<!-- ============================== THEORY ============================== -->
+<span class="section-tag">Theory</span>
+<h2>1. How the USART receives a byte</h2>
+
+<p>Transmit (Module 06) and receive are two independent halves of the same peripheral. The receiver continuously watches the RX line, samples the bits of each incoming frame, and reassembles them into a byte. When a full byte is ready, hardware copies it into the <strong>data register</strong> <code>DR</code> and raises a status flag so your code knows to pick it up.</p>
+
+<p>That flag is <strong><code>RXNE</code></strong> — "Read data register Not Empty", <code>USART_SR</code> bit&nbsp;5 (RM0041 §27.6.1). The mirror image of <code>TXE</code> from the transmit side:</p>
+
+<table>
+  <tr><th>Flag</th><th>SR bit</th><th>Set when…</th><th>Cleared by…</th></tr>
+  <tr><td><code>TXE</code> (transmit)</td><td>7</td><td>DR is empty, ready for a new byte to send</td><td>writing the next byte to <code>DR</code></td></tr>
+  <tr><td><code>RXNE</code> (receive)</td><td>5</td><td>a received byte is waiting in DR</td><td><strong>reading</strong> <code>DR</code></td></tr>
+</table>
+
+<h3>1.1 Reading DR clears RXNE</h3>
+<p>This is the key idea of the module. You do <strong>not</strong> clear <code>RXNE</code> by writing back to the status register. Instead, the single act of <em>reading</em> <code>USART_DR</code> both gives you the byte <em>and</em> acknowledges it, dropping <code>RXNE</code> back to 0 so the receiver is armed for the next byte. One read = "I took it."</p>
+
+<div class="diagram">Polled receive — the RXNE handshake
+
+   line idle ──► byte arrives ──► hardware sets RXNE=1, loads DR
+                                          │
+        your code: while(!(SR & RXNE)) {} │  (spins until set)
+                                          ▼
+                  read x = USART_DR  ──►  returns byte, RXNE auto-clears →0
+                                          │
+                            ready for the next byte</div>
+
+<h3>1.2 Overrun (ORE)</h3>
+<p>If a second byte arrives before you have read the first one out of <code>DR</code>, the new byte cannot be stored — the old one would be lost. Hardware flags this as an <strong>overrun</strong>: <code>ORE</code> (<code>USART_SR</code> bit&nbsp;3). In a polled loop you avoid overruns by reading <code>DR</code> promptly. ORE is cleared by the documented sequence of reading <code>SR</code> then <code>DR</code> (RM0041 §27.6.1). For this simple echo we read fast enough that ORE rarely matters, but a robust driver checks it. The interrupt-driven design in Module&nbsp;10 makes overrun much less likely because the CPU is notified the instant a byte lands.</p>
+
+<h3>1.3 Polled vs interrupt receive</h3>
+<p>What we do here is <strong>polled</strong> (programmed-I/O) receive: the CPU sits in a loop testing <code>RXNE</code> and does nothing else until a byte arrives. Simple and perfectly fine for an echo demo, but it <em>blocks</em> — the CPU cannot do other work while waiting. The alternative is <strong>interrupt-driven</strong> receive: set <code>RXNEIE</code> (<code>CR1</code> bit&nbsp;5), enable the USART1 IRQ in the NVIC, and let the hardware call an interrupt handler the moment a byte arrives. The CPU runs other code in between. That is <a href="../10-interrupts-nvic/10-interrupts-nvic.html">Module&nbsp;10</a>; here we stay with the simpler polled style.</p>
+
+<h2>2. Pin and register setup (RX added to TX)</h2>
+
+<p>Module 06 already configured <code>PA9</code> as the TX pin and enabled <code>TE</code>. Receive adds exactly two things:</p>
+
+<ol>
+  <li>Configure <strong><code>PA10</code> as an input floating pin</strong> in <code>GPIOA_CRH</code> — nibble <code>0x4</code>.</li>
+  <li>Set the <strong><code>RE</code></strong> bit (<code>CR1</code> bit&nbsp;2) in addition to <code>TE</code> and <code>UE</code>.</li>
+</ol>
+
+<p><code>PA9</code> and <code>PA10</code> both live in <code>CRH</code> (it covers pins 8–15). Their 4-bit fields:</p>
+
+<div class="diagram">GPIOA_CRH — PA9 (TX) and PA10 (RX)
+
+   PA9  field at bit (9 -8)*4 = 4   → nibble 0xB = 1011 (MODE=11 out50MHz, CNF=10 AF push-pull)
+   PA10 field at bit (10-8)*4 = 8   → nibble 0x4 = 0100 (MODE=00 input,    CNF=01 floating)
+
+   bit:  ...15 14 13 12 | 11 10  9  8 | 7  6  5  4 | 3  2  1  0
+   pin:  ...   pin11    |   pin10     |   pin9     |   pin8
+                 RX nibble 0x4 ──^^^^   ^^^^── TX nibble 0xB</div>
+
+<p>RX is a plain <em>floating input</em> (the idle UART line is held high by the transmitter on the other end, so no internal pull is needed). The relevant bits:</p>
+
+<table>
+  <tr><th>Register</th><th>Address</th><th>What to set</th></tr>
+  <tr><td><code>RCC_APB2ENR</code></td><td><code>0x40021018</code></td><td>bit&nbsp;2 IOPAEN, bit&nbsp;14 USART1EN</td></tr>
+  <tr><td><code>GPIOA_CRH</code></td><td><code>0x40010804</code></td><td>PA9 nibble <code>0xB</code>, PA10 nibble <code>0x4</code></td></tr>
+  <tr><td><code>USART1_SR</code></td><td><code>0x40013800</code></td><td>read bit&nbsp;5 RXNE, bit&nbsp;7 TXE</td></tr>
+  <tr><td><code>USART1_DR</code></td><td><code>0x40013804</code></td><td>read to receive / write to send</td></tr>
+  <tr><td><code>USART1_BRR</code></td><td><code>0x40013808</code></td><td><code>0x0341</code> = 9600 baud @ 8 MHz</td></tr>
+  <tr><td><code>USART1_CR1</code></td><td><code>0x4001380C</code></td><td>bit&nbsp;2 RE, bit&nbsp;3 TE, bit&nbsp;13 UE</td></tr>
+</table>
+
+<div class="box ok">
+  <span class="box-title">This module IS verifiable in QEMU</span>
+  Unlike GPIO, timers, I2C or DMA, the QEMU <code>stm32vldiscovery</code> machine <strong>fully emulates the USART receiver</strong>. With the standard run command, USART1 RX is wired to <strong>stdin</strong>: anything you type in the terminal (or pipe into QEMU) arrives at the receiver and sets <code>RXNE</code>. So your echo loop genuinely echoes — no register-read-back guessing this time.
+</div>
+
+<!-- ============================== EXERCISE ============================== -->
+<span class="section-tag">Guided Exercise</span>
+<h2>3. Build a serial echo loop</h2>
+
+<p><strong>Goal:</strong> initialise USART1 for both TX and RX, print a one-line prompt, then loop forever: read a byte with <code>uart_getc</code> and send it straight back with <code>uart_putc</code>. On a carriage return (<code>'\r'</code>, what the Enter key sends) also emit a <code>'\n'</code> so the cursor moves to a fresh line. You will:</p>
+<ol>
+  <li>Extend <code>uart_init</code> to configure <code>PA10</code> (input floating) and set <code>RE</code> alongside <code>TE</code>/<code>UE</code>.</li>
+  <li>Write <code>uart_getc</code>: poll <code>RXNE</code>, then read and return <code>DR</code>.</li>
+  <li>Write the echo loop in <code>main</code>.</li>
+</ol>
+
+<h3>3.1 Skeleton — create <code>07-uart-receive/main.c</code></h3>
+<p>Fill in every <code>TODO</code>. Do not look at the reference solution until you have tried the hints.</p>
+
+<pre><code>#include &lt;stdint.h&gt;
+
+/* ---- Register definitions ------------------------------------------------ */
+#define RCC_APB2ENR   (*(volatile uint32_t *)0x40021018U)
+#define GPIOA_CRH     (*(volatile uint32_t *)0x40010804U)
+#define USART1_SR     (*(volatile uint32_t *)0x40013800U)
+#define USART1_DR     (*(volatile uint32_t *)0x40013804U)
+#define USART1_BRR    (*(volatile uint32_t *)0x40013808U)
+#define USART1_CR1    (*(volatile uint32_t *)0x4001380CU)
+
+#define RCC_IOPAEN    (1U &lt;&lt; 2)
+#define RCC_USART1EN  (1U &lt;&lt; 14)
+
+#define USART_SR_RXNE (1U &lt;&lt; 5)    /* received data ready  */
+#define USART_SR_TXE  (1U &lt;&lt; 7)    /* TX data reg empty    */
+
+#define USART_CR1_RE  (1U &lt;&lt; 2)    /* receiver enable      */
+#define USART_CR1_TE  (1U &lt;&lt; 3)    /* transmitter enable   */
+#define USART_CR1_UE  (1U &lt;&lt; 13)   /* USART enable         */
+
+#define USART1_BRR_9600  (0x0341U) /* 9600 baud @ 8 MHz    */
+
+static void uart_init(void)
+{
+    /* Clock GPIOA + USART1 */
+    RCC_APB2ENR |= (RCC_IOPAEN | RCC_USART1EN);
+
+    /* TODO 1: configure CRH so PA9 = AF push-pull (nibble 0xB, bits[7:4])
+     *         AND PA10 = input floating (nibble 0x4, bits[11:8]).
+     *         Clear both nibbles, then OR in the two values. */
+
+    USART1_BRR = USART1_BRR_9600;
+
+    /* TODO 2: enable transmitter, RECEIVER, and the USART:
+     *         set TE | RE | UE in CR1. (RE is the new bit this module.) */
+}
+
+static void uart_putc(uint8_t c)
+{
+    while ((USART1_SR &amp; USART_SR_TXE) == 0U) { }
+    USART1_DR = (uint32_t)c;
+}
+
+static uint8_t uart_getc(void)
+{
+    /* TODO 3: poll until RXNE is set, then read DR and return the low 8 bits.
+     *         Reading DR is what clears RXNE - no extra write needed. */
+    return 0U; /* replace */
+}
+
+int main(void)
+{
+    uint8_t c;
+
+    uart_init();
+
+    /* prompt (send a short string; reuse your uart_puts from Module 06) */
+
+    for (;;)
+    {
+        /* TODO 4: c = uart_getc();  then echo c back with uart_putc(c).
+         *         If c == '\r', also uart_putc('\n'). */
+    }
+
+    return 0;
+}
+</code></pre>
+
+<h3>3.2 Build &amp; run — type into it</h3>
+<p>From inside the <code>07-uart-receive/</code> folder:</p>
+<pre><code>make -f ../common/Makefile SRC=main.c run</code></pre>
+<p>QEMU connects USART1 to your terminal. After the prompt prints, <strong>type</strong> some characters and press Enter — each character appears because your program echoes it back. (The terminal itself does not echo what QEMU receives; what you see is your own echo loop at work.) Quit with <kbd>Ctrl-A</kbd> then <kbd>X</kbd>.</p>
+
+<h3>3.3 Build &amp; run — pipe input (non-interactive)</h3>
+<p>You can also feed input from stdin without typing, which is handy for scripted testing:</p>
+<pre><code>printf 'hello\r' | qemu-system-arm -M stm32vldiscovery -display none \
+    -serial stdio -serial null -serial null -kernel build/firmware.elf</code></pre>
+<p>The bytes <code>h e l l o</code> arrive at USART1 RX, set <code>RXNE</code> one at a time, and your loop echoes them — so <code>hello</code> appears on stdout, followed by the newline triggered by <code>'\r'</code>.</p>
+
+<div class="box note">
+  <span class="box-title">Where does the input come from?</span>
+  Input arrives on <strong>stdin</strong> of the QEMU process. Interactively that is your keyboard; in a pipe it is whatever you piped in. QEMU routes the first <code>-serial stdio</code> backend to USART1, so stdin → USART1 RX and USART1 TX → stdout.
+</div>
+
+<h3>3.4 Hints</h3>
+<details class="hint">
+  <summary>Hint 1 — configuring PA9 and PA10 together in CRH</summary>
+  <p>PA9's field starts at bit <code>(9-8)*4 = 4</code>; PA10's at <code>(10-8)*4 = 8</code>. Clear both, then set both:</p>
+  <p><code>GPIOA_CRH = (GPIOA_CRH &amp; ~((0xFU&lt;&lt;4) | (0xFU&lt;&lt;8))) | (0xBU&lt;&lt;4) | (0x4U&lt;&lt;8);</code></p>
+  <p><code>0xB</code> = AF push-pull 50&nbsp;MHz (TX); <code>0x4</code> = input floating (RX).</p>
+</details>
+<details class="hint">
+  <summary>Hint 2 — enabling the receiver</summary>
+  <p>The only difference from the TX-only init is the extra <code>RE</code> bit:
+  <code>USART1_CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;</code> Without <code>RE</code> the receive hardware stays off and <code>RXNE</code> never sets.</p>
+</details>
+<details class="hint">
+  <summary>Hint 3 — uart_getc: poll then read</summary>
+  <p>Mirror <code>uart_putc</code> but wait on the receive flag, then read DR:</p>
+  <p><code>while ((USART1_SR &amp; USART_SR_RXNE) == 0U) { }</code><br>
+     <code>return (uint8_t)(USART1_DR &amp; 0xFFU);</code></p>
+  <p>The read of <code>USART1_DR</code> clears <code>RXNE</code> as a side effect — do not write SR to clear it.</p>
+</details>
+<details class="hint">
+  <summary>Hint 4 — the echo loop and the '\r' → '\n' touch</summary>
+  <p><code>c = uart_getc(); uart_putc(c); if (c == (uint8_t)'\r') { uart_putc((uint8_t)'\n'); }</code> The terminal sends <code>'\r'</code> when you press Enter; emitting <code>'\n'</code> too makes the cursor drop to a clean new line.</p>
+</details>
+
+<div class="box ok">
+  <span class="box-title">Reference solution</span>
+  Full, commented solution (with a reusable <code>uart_puts</code> and a newlib <code>_write</code> for <code>printf</code>): <code>solutions/07-uart-receive.c</code>. Try every hint first.
+</div>
+
+<!-- ============================== QUESTIONS ============================== -->
+<span class="section-tag">Verification Questions</span>
+<h2>4. Check your understanding</h2>
+
+<details class="answer">
+  <summary>Q1. What does the <code>RXNE</code> flag mean, and which SR bit is it?</summary>
+  <p><code>RXNE</code> = "Read data register Not Empty", <code>USART_SR</code> bit&nbsp;5. Hardware sets it when a complete received byte has been moved into <code>DR</code> and is waiting for the program to read it. It is the receive-side counterpart of <code>TXE</code> (bit&nbsp;7) on the transmit side.</p>
+</details>
+<details class="answer">
+  <summary>Q2. How do you clear <code>RXNE</code> after a byte arrives?</summary>
+  <p>By <strong>reading</strong> <code>USART_DR</code>. That single read returns the received byte <em>and</em> clears <code>RXNE</code> automatically, re-arming the receiver. You never write to SR to clear it — reading DR is the acknowledgement.</p>
+</details>
+<details class="answer">
+  <summary>Q3. What is an overrun (<code>ORE</code>) and when does it happen?</summary>
+  <p>An overrun occurs when a new byte finishes arriving before the previous one has been read out of <code>DR</code>. There is nowhere to put the new byte without losing the old, so hardware sets <code>ORE</code> (<code>USART_SR</code> bit&nbsp;3) and the data is lost. In a polled loop you prevent it by reading <code>DR</code> promptly; <code>ORE</code> is cleared by reading <code>SR</code> then <code>DR</code>. Interrupt-driven receive (Module 10) reduces the risk because the CPU is notified the moment a byte lands.</p>
+</details>
+<details class="answer">
+  <summary>Q4. What is the difference between polled and interrupt-driven receive?</summary>
+  <p><strong>Polled:</strong> the CPU spins in a loop testing <code>RXNE</code> and does nothing else until a byte arrives — simple, but it blocks the CPU. <strong>Interrupt-driven:</strong> you set <code>RXNEIE</code> (<code>CR1</code> bit&nbsp;5) and enable the USART1 IRQ in the NVIC; hardware calls a handler the instant a byte arrives, freeing the CPU to do other work in between. This module uses polling; Module 10 covers interrupts.</p>
+</details>
+<details class="answer">
+  <summary>Q5. Why does the echo work in QEMU when GPIO did not?</summary>
+  <p>QEMU's <code>stm32vldiscovery</code> machine fully emulates the USART, including the receiver, whereas it does not emulate GPIO at all. With <code>-serial stdio</code>, USART1 RX is connected to the process's stdin, so typed or piped bytes set <code>RXNE</code> for real and your code can read them. That is why this is the first module whose <em>input</em> path is directly testable in the emulator.</p>
+</details>
+
+<details class="answer">
+  <summary>Q6. Why configure PA10 as <em>floating</em> input rather than with a pull resistor?</summary>
+  <p>An idle UART line is driven high by the transmitter on the other end, so the receiver does not need an internal pull-up or pull-down to define the idle level — adding one would just fight the line driver. Floating (CNF=01, nibble <code>0x4</code>) is the correct and simplest choice for a standard push-pull UART connection.</p>
+</details>
+
+<div class="modfooter">
+  <a href="../06-uart-transmit/06-uart-transmit.html">← 06 · UART Transmit</a>
+  <a href="../08-systick-timer/08-systick-timer.html">08 · SysTick Timer →</a>
+</div>
+
+</div>
+</body>
+</html>

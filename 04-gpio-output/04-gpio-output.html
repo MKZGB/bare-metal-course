@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · GPIO Output — Bare-Metal STM32</title>
+<link rel="stylesheet" href="../common/style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <a href="../README.md">Home</a>
+  <a href="../glossary.html">Glossary</a>
+  <a href="../03-memory-mapped-registers/03-memory-mapped-registers.html">‹ Prev</a>
+  <a href="../05-gpio-input/05-gpio-input.html">Next ›</a>
+  <a href="04-gpio-output-pt.html">🌐 Português</a>
+  <span class="spacer"></span>
+  <span class="badge">STM32F100RBT6 · RM0041</span>
+</nav>
+
+<div class="wrap">
+
+<h1><span class="modnum">Module 04</span> GPIO Output — Driving the LED</h1>
+<p class="subtitle">Configure a pin as a push-pull output using <code>CRL/CRH</code> and toggle the green LED (LD3 / PC9) with the atomic <code>BSRR</code> register.</p>
+
+<div class="box note">
+  <span class="box-title">Dependencies</span>
+  Complete <a href="../03-memory-mapped-registers/03-memory-mapped-registers.html">Module 03 (Memory-Mapped Registers)</a> first — this module assumes you are comfortable reading and writing peripheral registers with <code>volatile</code> pointers. The shared <code>common/startup.c</code> and <code>common/linker.ld</code> are explained in Modules 02–03.
+</div>
+
+<!-- ============================== THEORY ============================== -->
+<span class="section-tag">Theory</span>
+<h2>1. What a GPIO peripheral does</h2>
+
+<p>A <strong>G</strong>eneral <strong>P</strong>urpose <strong>I</strong>nput/<strong>O</strong>utput port is a block of pins the CPU can drive high/low (output) or sense (input). On the STM32F100 the pins are grouped into ports <code>A</code>, <code>B</code>, <code>C</code>, <code>D</code>, each up to 16 pins wide. On the STM32VLDISCOVERY board the two user LEDs are:</p>
+
+<ul>
+  <li><strong>LD3 (green)</strong> → <code>PC9</code> (port C, pin 9)</li>
+  <li><strong>LD4 (blue)</strong> → <code>PC8</code> (port C, pin 8)</li>
+</ul>
+
+<p>Driving the pin high lights the LED. This module configures <code>PC9</code> as an output and blinks it.</p>
+
+<div class="box danger">
+  <span class="box-title">⚠ STM32F1 uses CRL/CRH, NOT MODER</span>
+  If you have seen STM32F4 tutorials you may expect a <code>MODER</code> register. <strong>It does not exist on the STM32F100.</strong> The STM32F1 family configures each pin with two registers — <code>GPIOx_CRL</code> (pins&nbsp;0–7) and <code>GPIOx_CRH</code> (pins&nbsp;8–15) — using <strong>4 bits per pin</strong>. Always use CRL/CRH on this chip (RM0041 §8.2).
+</div>
+
+<h3>1.1 The clock-gating rule</h3>
+<p>Every peripheral on an STM32 starts with its clock <em>switched off</em> to save power. A peripheral with no clock ignores all register writes — a classic "my code does nothing" bug. Before touching GPIO port C you must enable its clock in the RCC:</p>
+
+<table>
+  <tr><th>Register</th><th>Address</th><th>Bit</th><th>Meaning</th></tr>
+  <tr><td><code>RCC_APB2ENR</code></td><td><code>0x40021018</code></td><td>bit 4 — <code>IOPCEN</code></td><td>Enable clock for GPIO port C</td></tr>
+</table>
+<p class="muted">(bit 2 = port A, bit 3 = port B, bit 4 = port C, bit 5 = port D — RM0041 §7.3.7.)</p>
+
+<h3>1.2 Configuring a pin: CRL / CRH</h3>
+<p>Each pin gets a 4-bit field: two <strong>MODE</strong> bits and two <strong>CNF</strong> bits.</p>
+
+<table>
+  <tr><th>MODE[1:0]</th><th>Meaning</th></tr>
+  <tr><td><code>00</code></td><td>Input mode (reset state)</td></tr>
+  <tr><td><code>01</code></td><td>Output, max 10 MHz</td></tr>
+  <tr><td><code>10</code></td><td>Output, max 2 MHz</td></tr>
+  <tr><td><code>11</code></td><td>Output, max 50 MHz</td></tr>
+</table>
+<table>
+  <tr><th>CNF[1:0] (output mode)</th><th>Meaning</th></tr>
+  <tr><td><code>00</code></td><td>Push-pull</td></tr>
+  <tr><td><code>01</code></td><td>Open-drain</td></tr>
+  <tr><td><code>10</code></td><td>Alternate-function push-pull</td></tr>
+  <tr><td><code>11</code></td><td>Alternate-function open-drain</td></tr>
+</table>
+
+<p>Pin 9 is in <code>CRH</code> (it handles pins 8–15). Its 4-bit field starts at bit
+<code>(9 − 8) × 4 = 4</code>. For a push-pull output at 2 MHz:</p>
+
+<div class="diagram">CRH for PC9  (push-pull output, 2 MHz)
+
+  field value = (CNF &lt;&lt; 2) | MODE = (00 &lt;&lt; 2) | 10 = 0b0010 = 0x2
+
+   bit:  ... 11 10  9  8 | 7  6  5  4 | 3  2  1  0
+   pin:  ...   pin 10    |   pin 9    |   pin 8
+   PC9 nibble at bits[7:4] -----^^^^</div>
+
+<h3>1.3 Setting the output: ODR vs BSRR</h3>
+<p>You could write the output data register <code>GPIOC_ODR</code> directly, but a read-modify-write of a shared register can race with an interrupt that touches another pin. The STM32 provides <code>GPIOx_BSRR</code> (Bit Set/Reset Register) for <strong>atomic, single-write</strong> pin control:</p>
+<ul>
+  <li>Write <code>1</code> to bit <code>n</code> (0–15) → pin <code>n</code> goes <strong>high</strong>.</li>
+  <li>Write <code>1</code> to bit <code>n+16</code> → pin <code>n</code> goes <strong>low</strong>.</li>
+  <li>Writing <code>0</code> to any bit has no effect, so you never disturb other pins.</li>
+</ul>
+
+<table>
+  <tr><th>Register</th><th>Address</th><th>Offset</th></tr>
+  <tr><td><code>GPIOC base</code></td><td><code>0x40011000</code></td><td>—</td></tr>
+  <tr><td><code>GPIOC_CRH</code></td><td><code>0x40011004</code></td><td>0x04</td></tr>
+  <tr><td><code>GPIOC_ODR</code></td><td><code>0x4001100C</code></td><td>0x0C</td></tr>
+  <tr><td><code>GPIOC_BSRR</code></td><td><code>0x40011010</code></td><td>0x10</td></tr>
+</table>
+
+<div class="box warn">
+  <span class="box-title">What QEMU shows (be honest with yourself)</span>
+  The <code>stm32vldiscovery</code> machine in QEMU <strong>does not emulate GPIO</strong>. Your writes are accepted but no LED appears, and reading the registers back returns <code>0</code>. That is expected. You verify this module by <em>reasoning about the bit math</em> and confirming the program builds and runs without faulting. The first <em>visible</em> output in QEMU arrives in <a href="../06-uart-transmit/06-uart-transmit.html">Module 06 (UART)</a>. On real STM32VLDISCOVERY hardware the LED really blinks.
+</div>
+
+<!-- ============================== EXERCISE ============================== -->
+<span class="section-tag">Guided Exercise</span>
+<h2>2. Blink LD3 (PC9)</h2>
+
+<p><strong>Goal:</strong> write <code>main()</code> so the green LED toggles forever with a visible-on-hardware blink rate. You will:</p>
+<ol>
+  <li>Enable the GPIO port C clock (<code>RCC_APB2ENR</code> bit 4).</li>
+  <li>Configure <code>PC9</code> as a 2 MHz push-pull output in <code>CRH</code>.</li>
+  <li>In an infinite loop, set then clear <code>PC9</code> via <code>BSRR</code>, with a delay between.</li>
+</ol>
+
+<h3>2.1 Skeleton — create <code>04-gpio-output/main.c</code></h3>
+<p>Fill in every <code>TODO</code>. Do not look at the reference solution unless you are truly stuck.</p>
+
+<pre><code>#include &lt;stdint.h&gt;
+
+/* Register definitions (volatile = never cache in a CPU register) */
+#define RCC_APB2ENR  (*(volatile uint32_t *)0x40021018U)
+#define GPIOC_CRH    (*(volatile uint32_t *)0x40011004U)
+#define GPIOC_BSRR   (*(volatile uint32_t *)0x40011010U)
+
+#define RCC_IOPCEN   (1U &lt;&lt; 4)   /* GPIO port C clock enable */
+#define LED_PIN      9U          /* LD3 (green) = PC9        */
+
+static void delay(volatile uint32_t count)
+{
+    while (count &gt; 0U) { count--; }
+}
+
+int main(void)
+{
+    /* TODO 1: enable the clock for GPIO port C in RCC_APB2ENR */
+
+    /* TODO 2: configure PC9 as output push-pull 2 MHz.
+     *         - the pin-9 field in CRH is at bit ((9-8)*4) = 4
+     *         - clear that 4-bit field, then OR in 0x2 (MODE=10, CNF=00)
+     *         - use a read-modify-write so other pins are untouched */
+
+    for (;;)
+    {
+        /* TODO 3: set PC9 high using BSRR (write bit LED_PIN) */
+        delay(200000U);
+        /* TODO 4: set PC9 low using BSRR (write bit LED_PIN + 16) */
+        delay(200000U);
+    }
+
+    return 0;
+}
+</code></pre>
+
+<h3>2.2 Build &amp; run</h3>
+<p>From inside the <code>04-gpio-output/</code> folder:</p>
+<pre><code>make -f ../common/Makefile SRC=main.c run</code></pre>
+<p>QEMU starts, shows no LED (expected — see the note above), and runs your loop. Quit with <kbd>Ctrl-A</kbd> then <kbd>X</kbd>. Success criterion for this module: it <strong>compiles with no warnings and runs without hitting the fault handler</strong>.</p>
+
+<h3>2.3 Hints</h3>
+<details class="hint">
+  <summary>Hint 1 — enabling the clock</summary>
+  <p>Use a read-modify-write OR so you do not clobber other enable bits:
+  <code>RCC_APB2ENR |= RCC_IOPCEN;</code></p>
+</details>
+<details class="hint">
+  <summary>Hint 2 — the CRH field math</summary>
+  <p>The shift is <code>(LED_PIN - 8) * 4 = 4</code>. Mask to clear: <code>(0xFU &lt;&lt; 4)</code>. Value to write: <code>(0x2U &lt;&lt; 4)</code>. Combine:
+  <code>GPIOC_CRH = (GPIOC_CRH &amp; ~(0xFU &lt;&lt; 4)) | (0x2U &lt;&lt; 4);</code></p>
+</details>
+<details class="hint">
+  <summary>Hint 3 — set / clear with BSRR</summary>
+  <p>High: <code>GPIOC_BSRR = (1U &lt;&lt; LED_PIN);</code> &nbsp; Low: <code>GPIOC_BSRR = (1U &lt;&lt; (LED_PIN + 16U));</code></p>
+</details>
+
+<div class="box ok">
+  <span class="box-title">Reference solution</span>
+  Full, commented solution: <code>solutions/04-gpio-output.c</code>. Try every hint first.
+</div>
+
+<!-- ============================== QUESTIONS ============================== -->
+<span class="section-tag">Verification Questions</span>
+<h2>3. Check your understanding</h2>
+
+<details class="answer">
+  <summary>Q1. Why must you enable <code>IOPCEN</code> in RCC before configuring PC9?</summary>
+  <p>Each peripheral is clock-gated off at reset to save power. Without its bus clock the GPIO port does not register any writes, so <code>CRH</code> and <code>BSRR</code> writes are simply lost and the pin never changes.</p>
+</details>
+<details class="answer">
+  <summary>Q2. Why does the STM32F100 not have a MODER register?</summary>
+  <p><code>MODER</code> belongs to the newer GPIO design used on STM32F0/F3/F4. The STM32F1 family (including the F100) uses the older two-register scheme: <code>CRL</code> for pins 0–7 and <code>CRH</code> for pins 8–15, with 4 bits (MODE+CNF) per pin. Using MODER on this chip writes to a non-existent register.</p>
+</details>
+<details class="answer">
+  <summary>Q3. What is the advantage of <code>BSRR</code> over writing <code>ODR</code> directly?</summary>
+  <p><code>BSRR</code> is atomic: a single 32-bit write sets and/or clears exactly the pins whose bits you wrote <code>1</code> to, leaving all others alone. Writing <code>ODR</code> requires a read-modify-write, which can race with an interrupt that modifies another pin in the same port and lose that change.</p>
+</details>
+<details class="answer">
+  <summary>Q4. For PC9 you wrote the nibble <code>0x2</code> into CRH. Decode it.</summary>
+  <p><code>0x2 = 0b0010</code>. Low two bits MODE = <code>10</code> → output at 2 MHz. High two bits CNF = <code>00</code> → push-pull. So: push-pull output, 2 MHz slew.</p>
+</details>
+<details class="answer">
+  <summary>Q5. You run it in QEMU and see no LED. Is your code wrong?</summary>
+  <p>Not necessarily — QEMU's <code>stm32vldiscovery</code> does not emulate GPIO, so no pin state is visible and register read-back returns 0. Correct code shows nothing here; it blinks on real hardware. Visible verification in QEMU starts with UART in Module 06.</p>
+</details>
+
+<div class="modfooter">
+  <a href="../03-memory-mapped-registers/03-memory-mapped-registers.html">← 03 · Memory-Mapped Registers</a>
+  <a href="../05-gpio-input/05-gpio-input.html">05 · GPIO Input →</a>
+</div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10 · Interrupts &amp; the NVIC — Bare-Metal STM32</title>
+<link rel="stylesheet" href="../common/style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <a href="../README.md">Home</a>
+  <a href="../glossary.html">Glossary</a>
+  <a href="../09-general-purpose-timers/09-general-purpose-timers.html">‹ Prev</a>
+  <a href="../11-dma/11-dma.html">Next ›</a>
+  <a href="10-interrupts-nvic-pt.html">🌐 Português</a>
+  <span class="spacer"></span>
+  <span class="badge">STM32F100RBT6 · RM0041</span>
+</nav>
+
+<div class="wrap">
+
+<h1><span class="modnum">Module 10</span> Interrupts &amp; the NVIC</h1>
+<p class="subtitle">How the Cortex-M3 takes an exception, how the <code>NVIC</code> enables and dispatches a peripheral IRQ, and a real, QEMU-testable demo: a USART1 receive interrupt (<code>RXNEIE</code> → <code>USART1_IRQHandler</code>, IRQ&nbsp;37).</p>
+
+<div class="box note">
+  <span class="box-title">Dependencies</span>
+  This builds directly on <a href="../07-uart-receive/07-uart-receive.html">Module 07 (UART Receive)</a>, which received bytes by <em>polling</em> the <code>RXNE</code> flag. Here we replace that poll with an interrupt. The vector table you will hook into lives in <code>common/startup.c</code> (explained in Modules 02–03); the SysTick interrupt of <a href="../08-systick-timer/08-systick-timer.html">Module 08</a> was your first taste of an ISR.
+</div>
+
+<!-- ============================== THEORY ============================== -->
+<span class="section-tag">Theory</span>
+<h2>1. What an interrupt is, and why you want one</h2>
+
+<p>Polling — sitting in <code>while ((SR &amp; RXNE) == 0) {}</code> — wastes the CPU: it does nothing useful while it waits, and it can only watch one thing at a time. An <strong>interrupt</strong> inverts the relationship. The peripheral raises a request when it needs attention; the CPU drops what it is doing, runs a short <strong>Interrupt Service Routine (ISR)</strong>, and then resumes <em>exactly</em> where it was. The foreground code never polls.</p>
+
+<p>On a Cortex-M3 every interrupt and fault is an <strong>exception</strong> with a number. Exception numbers 1–15 are the <em>system exceptions</em> built into the core (Reset, NMI, HardFault, SVC, PendSV, <strong>SysTick</strong>, …). Exception numbers 16+ are the <em>external interrupts</em> from peripherals, which are also numbered from zero as <strong>IRQ&nbsp;0, 1, 2, …</strong> (so IRQ&nbsp;n = exception&nbsp;n+16). The block that manages all of them is the <strong>NVIC</strong>.</p>
+
+<h2>2. The NVIC — Nested Vectored Interrupt Controller</h2>
+<p>The NVIC is part of the Cortex-M3 core (not an STM32 peripheral), mapped in the System Control Space at <code>0xE000Exxx</code>. Its three jobs are in its name:</p>
+<ul>
+  <li><strong>Nested</strong> — a higher-priority interrupt can pre-empt a running lower-priority ISR.</li>
+  <li><strong>Vectored</strong> — hardware looks up the handler address directly from the <em>vector table</em>; you do not write a dispatcher that asks "who interrupted me?".</li>
+  <li><strong>Interrupt Controller</strong> — it holds the enable, pending, and priority state for every IRQ.</li>
+</ul>
+
+<h3>2.1 What the hardware does when an IRQ fires</h3>
+<div class="diagram">peripheral (USART1) sets RXNE, RXNEIE=1  ──► request to NVIC
+        │   NVIC: is IRQ 37 enabled? high enough priority?
+        ▼
+  CORE TAKES THE EXCEPTION  (all in hardware, no code):
+    1. push R0-R3, R12, LR, PC, xPSR onto the current stack   (8 words)
+    2. load PC from vector-table slot for IRQ 37  (g_vector_table[53])
+    3. run USART1_IRQHandler()  ── an ordinary C function
+    4. on return (BX LR with magic EXC_RETURN): pop those 8 registers
+        ▼
+  resume the interrupted instruction as if nothing happened</div>
+
+<p>Because the eight caller-saved registers are stacked and restored <em>by hardware</em>, an ISR on Cortex-M can be a plain C function — there is <strong>no prologue/epilogue assembly to write</strong>. That is why <code>common/startup.c</code> can declare every handler as a normal <code>void f(void)</code>.</p>
+
+<h3>2.2 The vector table is the dispatch mechanism</h3>
+<p>"Vectored" means the handler is found by table index, not by a software <code>switch</code>. Slot 0 is the initial stack pointer, slot 1 is <code>Reset_Handler</code>, slots 2–15 are the system exceptions, and slot <code>16 + n</code> is the handler for IRQ&nbsp;n. In <code>common/startup.c</code> every entry is a <code>WEAK</code> alias to <code>Default_Handler</code> (an infinite trap). When your module defines a function with the matching name — e.g. <code>USART1_IRQHandler</code> — the linker overrides the weak symbol, and slot 53 (IRQ&nbsp;37) now points at <em>your</em> code. You "register" an ISR simply by defining a correctly-named function.</p>
+
+<h3>2.3 Enabling an IRQ: the ISER registers</h3>
+<p>An IRQ does nothing until you <em>enable</em> it in the NVIC. The set-enable registers are a small array; write a <code>1</code> to a bit to enable that line (writing <code>0</code> is ignored, so there is no read-modify-write and no race):</p>
+
+<table>
+  <tr><th>Register</th><th>Address</th><th>Covers</th></tr>
+  <tr><td><code>NVIC_ISER0</code></td><td><code>0xE000E100</code></td><td>IRQ 0 … 31 (bit n = IRQ n)</td></tr>
+  <tr><td><code>NVIC_ISER1</code></td><td><code>0xE000E104</code></td><td>IRQ 32 … 63 (bit n = IRQ 32+n)</td></tr>
+  <tr><td><code>NVIC_ICER0/1</code></td><td><code>0xE000E180</code></td><td>clear-enable (disable an IRQ)</td></tr>
+  <tr><td><code>NVIC_ISPR0/1</code></td><td><code>0xE000E200</code></td><td>set-pending (software-trigger an IRQ)</td></tr>
+  <tr><td><code>NVIC_IPRn</code></td><td><code>0xE000E400</code></td><td>priority, one byte per IRQ — only the top 4 bits are used</td></tr>
+</table>
+
+<p>The index/bit arithmetic is the heart of this module. For IRQ&nbsp;<code>n</code>:</p>
+<div class="diagram">register index =  n / 32   (which ISER word)
+bit position  =  n % 32   (which bit in that word)
+
+   NVIC_ISER[n / 32] = (1U &lt;&lt; (n % 32));
+
+Example — USART1 = IRQ 37:
+   index = 37 / 32 = 1   → ISER1 (0xE000E104)
+   bit   = 37 % 32 = 5
+   ⇒ *(volatile uint32_t*)0xE000E104 = (1U &lt;&lt; 5);</div>
+
+<table>
+  <tr><th>Peripheral</th><th>IRQ #</th><th>ISER reg</th><th>Bit</th></tr>
+  <tr><td>EXTI line 0 (button PA0)</td><td>6</td><td>ISER0</td><td>6</td></tr>
+  <tr><td>TIM3</td><td>29</td><td>ISER0</td><td>29</td></tr>
+  <tr><td>USART1</td><td>37</td><td>ISER1</td><td>5</td></tr>
+  <tr><td>USART2</td><td>38</td><td>ISER1</td><td>6</td></tr>
+</table>
+<p class="muted">IRQ numbers are RM0041 Table 51. <strong>SysTick is different</strong>: it is a <em>system exception</em> (number 15), not an external IRQ, so it has no ISER bit at all — you enable it via <code>SYST_CSR.TICKINT</code> (Module 08). Priorities (IPR) are out of scope here; the reset priority of 0 works fine for a single interrupt.</p>
+
+<h2>3. EXTI: making a GPIO pin interrupt (the button)</h2>
+<p>A GPIO pin cannot drive an IRQ on its own. The <strong>EXTI</strong> (External Interrupt/event) controller sits between the pins and the NVIC. To make the user button <strong>B1 = PA0</strong> generate an interrupt you would, conceptually:</p>
+<ol>
+  <li>Clock <code>AFIO</code>, then point EXTI line&nbsp;0 at <em>port A</em> in <code>AFIO_EXTICR1</code> (0x40010008).</li>
+  <li><strong>Unmask</strong> line 0 in <code>EXTI_IMR</code> (0x40010400+0x00, set bit 0).</li>
+  <li>Select the edge: rising in <code>EXTI_RTSR</code> (offset 0x08, bit 0) — the button is active-high.</li>
+  <li>Enable IRQ&nbsp;6 (EXTI0) in the NVIC: <code>ISER0 |= (1U &lt;&lt; 6)</code>.</li>
+  <li>In <code>EXTI0_IRQHandler</code>, <strong>clear the pending bit</strong> by writing <code>1</code> to bit 0 of <code>EXTI_PR</code> (offset 0x14). EXTI_PR is <em>write-1-to-clear</em>; if you forget this the handler re-fires forever.</li>
+</ol>
+
+<div class="box warn">
+  <span class="box-title">QEMU cannot press the button</span>
+  Per the verified emulation matrix, <code>qemu-system-arm -M stm32vldiscovery</code> <strong>does not emulate GPIO or button input at all</strong> — <code>IDR</code> reads 0 and no pin edge is ever produced. So although the EXTI/NVIC setup above is correct for real hardware, you cannot trigger a button IRQ in QEMU. We therefore cover EXTI conceptually and make the <em>working</em> demo a peripheral QEMU <em>does</em> fully emulate: the USART.
+</div>
+
+<h2>4. The demonstrable interrupt: USART1 RX (RXNE → IRQ 37)</h2>
+<p>QEMU fully emulates the USARTs, <em>including</em> raising the USART1 interrupt when a byte arrives. So we turn Module 07's polled echo into an interrupt-driven one:</p>
+<ul>
+  <li>Set <code>RXNEIE</code> (<code>USART1_CR1</code> bit&nbsp;5): now whenever <code>RXNE</code> becomes 1, the USART asserts its IRQ line.</li>
+  <li>Enable IRQ&nbsp;37 in the NVIC (<code>ISER1</code> bit&nbsp;5).</li>
+  <li>In <code>USART1_IRQHandler</code>: confirm <code>RXNE</code>, <strong>read <code>DR</code></strong> (this returns the byte <em>and</em> clears <code>RXNE</code>, de-asserting the request), echo it, and bump a counter.</li>
+</ul>
+
+<h3>4.1 Sharing data with the handler: <code>volatile</code></h3>
+<p>The ISR runs asynchronously to <code>main()</code>. Any variable both touch must be declared <code>volatile</code>, or the optimiser may cache it in a register inside <code>main()</code>'s loop and never see the handler's updates:</p>
+<pre><code>static volatile uint32_t g_rx_count = 0U;   /* written by ISR, read by main */</code></pre>
+<p>For data wider than one aligned 32-bit word, you also need a <strong>critical section</strong> — briefly disable interrupts so <code>main()</code> reads a consistent snapshot. On Cortex-M that is <code>__asm volatile("cpsid i")</code> (mask) … <code>"cpsie i"</code> (unmask), or the <code>PRIMASK</code> register. Our counter is a single word, so a plain <code>volatile</code> suffices here.</p>
+
+<!-- ============================== EXERCISE ============================== -->
+<span class="section-tag">Guided Exercise</span>
+<h2>5. Interrupt-driven UART echo</h2>
+
+<p><strong>Goal:</strong> receive bytes over USART1 using an interrupt instead of polling. <code>main()</code> must never read <code>DR</code>; the ISR does all the work and reports through a <code>volatile</code> counter.</p>
+
+<h3>5.1 Skeleton — create <code>10-interrupts-nvic/main.c</code></h3>
+<p>Fill in every <code>TODO</code>. The TX helper and printf retarget are given (reused from Modules 06/07); your work is the NVIC enable math, the <code>RXNEIE</code> bit, and the ISR body.</p>
+
+<pre><code>#include &lt;stdint.h&gt;
+#include &lt;stdio.h&gt;
+
+#define RCC_APB2ENR   (*(volatile uint32_t *)0x40021018U)
+#define RCC_IOPAEN    (1U &lt;&lt; 2)
+#define RCC_USART1EN  (1U &lt;&lt; 14)
+
+#define GPIOA_CRH     (*(volatile uint32_t *)0x40010804U)
+
+#define USART1_SR     (*(volatile uint32_t *)0x40013800U)
+#define USART1_DR     (*(volatile uint32_t *)0x40013804U)
+#define USART1_BRR    (*(volatile uint32_t *)0x40013808U)
+#define USART1_CR1    (*(volatile uint32_t *)0x4001380CU)
+
+#define USART_SR_RXNE    (1U &lt;&lt; 5)
+#define USART_SR_TXE     (1U &lt;&lt; 7)
+#define USART_CR1_RE     (1U &lt;&lt; 2)
+#define USART_CR1_TE     (1U &lt;&lt; 3)
+#define USART_CR1_RXNEIE (1U &lt;&lt; 5)    /* RXNE interrupt enable */
+#define USART_CR1_UE     (1U &lt;&lt; 13)
+
+/* NVIC set-enable registers (array starting at 0xE000E100) */
+#define NVIC_ISER ((volatile uint32_t *)0xE000E100U)
+#define USART1_IRQn  (37U)            /* RM0041 Table 51 */
+
+/* Shared with the ISR -> MUST be volatile */
+static volatile uint32_t g_rx_count  = 0U;
+static volatile uint8_t  g_last_char = 0U;
+
+static void uart_putc(uint8_t c)
+{
+    while ((USART1_SR &amp; USART_SR_TXE) == 0U) { }
+    USART1_DR = (uint32_t)c;
+}
+
+static void nvic_enable_irq(uint32_t irqn)
+{
+    /* TODO 1: enable IRQ 'irqn' in the NVIC.
+     *   index = irqn / 32  (use irqn &gt;&gt; 5)
+     *   bit   = irqn % 32  (use irqn &amp; 0x1F)
+     *   write (1U &lt;&lt; bit) to NVIC_ISER[index]  -- a single store, no RMW. */
+}
+
+static void uart_init(void)
+{
+    RCC_APB2ENR |= (RCC_IOPAEN | RCC_USART1EN);
+    /* PA9 = AF push-pull (TX) nibble 0xB, PA10 = input floating (RX) nibble 0x4 */
+    GPIOA_CRH = (GPIOA_CRH &amp; ~((0xFU &lt;&lt; 4) | (0xFU &lt;&lt; 8)))
+              | (0xBU &lt;&lt; 4) | (0x4U &lt;&lt; 8);
+    USART1_BRR = 0x0341U;             /* 9600 @ 8 MHz */
+
+    /* TODO 2: enable TE, RE, the RXNE interrupt (RXNEIE), and UE in CR1.
+     *         RXNEIE is what makes RXNE raise an interrupt instead of just
+     *         setting a flag. */
+
+    /* TODO 3: enable USART1's line in the NVIC (call nvic_enable_irq). */
+}
+
+void USART1_IRQHandler(void);
+void USART1_IRQHandler(void)
+{
+    /* TODO 4: while RXNE is set:
+     *   - read USART1_DR into a uint8_t (this read clears RXNE -> de-asserts
+     *     the interrupt; forgetting it makes the handler re-fire forever)
+     *   - echo the byte with uart_putc; if it was '\r', also send '\n'
+     *   - store it in g_last_char and increment g_rx_count
+     * Draining in a while-loop is robust if several bytes are queued. */
+}
+
+int _write(int fd, const char *buf, int len)
+{
+    int i;
+    (void)fd;
+    for (i = 0; i &lt; len; i++) {
+        if (buf[i] == '\n') { uart_putc((uint8_t)'\r'); }
+        uart_putc((uint8_t)buf[i]);
+    }
+    return len;
+}
+
+int main(void)
+{
+    uint32_t seen = 0U;
+
+    uart_init();
+    (void)setvbuf(stdout, NULL, _IONBF, 0);
+    printf("\nUSART1 RX interrupt ready (IRQ 37). Type something.\n");
+
+    /* main() NEVER reads DR. It just reports what the ISR delivered.
+     * No flag-wait here -- the interrupt does the receiving. */
+    for (;;)
+    {
+        if (g_rx_count != seen)
+        {
+            seen = g_rx_count;
+            printf("[main] byte #%u: 0x%02X\n",
+                   (unsigned int)seen, (unsigned int)g_last_char);
+        }
+    }
+}
+
+/* newlib stubs (keep the link warning-clean) */
+int _read(int fd, char *b, int l)  { (void)fd; (void)b; (void)l; return 0; }
+int _close(int fd)                 { (void)fd; return -1; }
+int _lseek(int fd, int o, int d)   { (void)fd; (void)o; (void)d; return 0; }
+int _isatty(int fd)                { (void)fd; return 1; }
+int _fstat(int fd, void *s)        { (void)fd; (void)s; return 0; }
+</code></pre>
+
+<h3>5.2 Build &amp; run</h3>
+<p>From inside the <code>10-interrupts-nvic/</code> folder:</p>
+<pre><code>make -f ../common/Makefile SRC=main.c</code></pre>
+<p>Run interactively and type, or pipe input <em>after a short delay</em> so the bytes arrive once the interrupt is armed:</p>
+<pre><code>(sleep 1; printf 'AB') | qemu-system-arm -M stm32vldiscovery -display none \
+    -serial stdio -serial null -serial null -kernel build/firmware.elf</code></pre>
+<p>You should see <code>AB</code> echoed by the ISR, then a <code>[main] byte #…</code> report line. Quit with <kbd>Ctrl-A</kbd> then <kbd>X</kbd>.</p>
+
+<div class="box warn">
+  <span class="box-title">Why the <code>sleep 1</code> matters in QEMU</span>
+  QEMU front-loads <em>instantly</em>-piped stdin and may deliver it before the guest finishes reset, so <code>printf 'AB' | qemu…</code> can miss the bytes entirely — this affects even the polled receiver of Module 07, so it is not an interrupt bug. A small <code>sleep</code> (or just typing interactively) makes the bytes arrive after <code>uart_init()</code> has armed <code>RXNEIE</code> and the NVIC. This is purely a host-side timing quirk; on real hardware the interrupt fires whenever a byte actually arrives.
+</div>
+
+<h3>5.3 Hints</h3>
+<details class="hint">
+  <summary>Hint 1 — the NVIC enable (TODO 1)</summary>
+  <p>The ISER registers form a 32-bit array at <code>0xE000E100</code>. For IRQ <code>n</code>, the word is <code>n / 32</code> and the bit is <code>n % 32</code>. Using shifts/masks:
+  <code>NVIC_ISER[irqn &gt;&gt; 5U] = (1U &lt;&lt; (irqn &amp; 0x1FU));</code> No read-modify-write: these are write-1-to-set registers, so writing the single bit cannot disturb others.</p>
+</details>
+<details class="hint">
+  <summary>Hint 2 — arming the source (TODO 2 &amp; 3)</summary>
+  <p>One combined store does it:
+  <code>USART1_CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE | USART_CR1_UE;</code>
+  Then <code>nvic_enable_irq(USART1_IRQn);</code>. Both halves are needed: <code>RXNEIE</code> lets the USART <em>raise</em> the request, the NVIC bit lets the core <em>accept</em> it. Omit either and nothing fires.</p>
+</details>
+<details class="hint">
+  <summary>Hint 3 — the ISR body (TODO 4)</summary>
+  <p><code>while ((USART1_SR &amp; USART_SR_RXNE) != 0U) { uint8_t c = (uint8_t)(USART1_DR &amp; 0xFFU); uart_putc(c); if (c=='\r') uart_putc('\n'); g_last_char=c; g_rx_count++; }</code>
+  The <code>USART1_DR</code> read is what clears <code>RXNE</code> — that is your acknowledgement to the hardware. No manual register save/restore is needed; the core stacked your context before entering.</p>
+</details>
+
+<div class="box ok">
+  <span class="box-title">Reference solution</span>
+  Full, commented solution: <code>solutions/10-interrupts-nvic.c</code>. It also software-pends the IRQ once at init (via <code>NVIC_ISPR</code>) to cover the case where a byte was already waiting when the interrupt was armed. Try every hint first.
+</div>
+
+<!-- ============================== QUESTIONS ============================== -->
+<span class="section-tag">Verification Questions</span>
+<h2>6. Check your understanding</h2>
+
+<details class="answer">
+  <summary>Q1. TIM3 is IRQ 29 and USART2 is IRQ 38. Which ISER register and bit enables each?</summary>
+  <p>Index = IRQ/32, bit = IRQ%32.<br>
+  <strong>TIM3 (29):</strong> 29/32 = 0 → <code>ISER0</code> (0xE000E100), bit 29%32 = <strong>29</strong>.<br>
+  <strong>USART2 (38):</strong> 38/32 = 1 → <code>ISER1</code> (0xE000E104), bit 38%32 = <strong>6</strong>.<br>
+  So <code>ISER0 = (1U &lt;&lt; 29)</code> and <code>ISER1 = (1U &lt;&lt; 6)</code> respectively.</p>
+</details>
+<details class="answer">
+  <summary>Q2. Why does a Cortex-M3 ISR need no manual register save/restore (no assembly prologue)?</summary>
+  <p>On exception entry the core <em>automatically</em> pushes the eight caller-saved registers (R0–R3, R12, LR, PC, xPSR) onto the active stack, and on exception return it pops them back. The C calling convention says a function may freely use those registers, and the callee-saved ones it must preserve itself — which the compiler already does. So the hardware-stacked frame plus normal C codegen means a plain C function is a complete, correct handler. (This is why <code>common/startup.c</code> declares handlers as ordinary <code>void f(void)</code>.)</p>
+</details>
+<details class="answer">
+  <summary>Q3. Why must a variable shared between an ISR and <code>main()</code> be <code>volatile</code>?</summary>
+  <p>The ISR runs asynchronously, so from the compiler's view <code>main()</code> appears to be the only writer of that variable. Without <code>volatile</code> it may legally hoist the variable into a register at the top of a loop and never re-read memory, so it never observes the ISR's updates (the loop would spin forever on a stale value). <code>volatile</code> forces an actual memory access on every read/write. (For multi-word data you additionally need a critical section — briefly mask interrupts with <code>cpsid i</code>/<code>cpsie i</code> — so the reader gets a consistent snapshot.)</p>
+</details>
+<details class="answer">
+  <summary>Q4. What is the difference between a "system exception" like SysTick and an "external interrupt" like USART1?</summary>
+  <p>System exceptions (numbers 1–15: Reset, NMI, HardFault, SVC, PendSV, SysTick, …) are built into the Cortex-M3 core itself; they are not in the NVIC's IRQ-numbering space and have <strong>no ISER bit</strong>. SysTick, for instance, is enabled through its own <code>SYST_CSR.TICKINT</code> bit (Module 08). External interrupts are the peripheral IRQs, numbered 0+ (exception 16+), and each one is individually enabled/disabled/prioritised through the NVIC's ISER/ICER/IPR registers. Both kinds dispatch through the same vector table.</p>
+</details>
+<details class="answer">
+  <summary>Q5. For an EXTI (button) interrupt, how do you clear the pending flag, and what happens if you forget?</summary>
+  <p>You write a <strong>1</strong> to the corresponding bit of <code>EXTI_PR</code> (Pending Register, offset 0x14) — it is write-1-to-clear, so writing 1 clears the flag and 0 leaves it alone. If you forget, the EXTI line stays pending: the moment the handler returns, the NVIC sees the still-asserted request and immediately re-enters the handler, so it appears to fire forever. The same principle applies to every interrupt — the handler must clear the source (for USART RX it is the act of <em>reading DR</em>; for TIM it is clearing the <code>UIF</code> in <code>SR</code>).</p>
+</details>
+
+<div class="modfooter">
+  <a href="../09-general-purpose-timers/09-general-purpose-timers.html">← 09 · General-Purpose Timers</a>
+  <a href="../11-dma/11-dma.html">11 · DMA →</a>
+</div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>13 · Driver SPI — Bare-Metal STM32</title>
+<link rel="stylesheet" href="../common/style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <a href="../README-pt.md">Início</a>
+  <a href="../glossary-pt.html">Glossário</a>
+  <a href="../12-i2c/12-i2c-pt.html">‹ Anterior</a>
+  <a href="../README-pt.md">Início do curso ›</a>
+  <a href="13-spi.html">🌐 English</a>
+  <span class="spacer"></span>
+  <span class="badge">STM32F100RBT6 · RM0041</span>
+</nav>
+
+<div class="wrap">
+
+<h1><span class="modnum">Módulo 13</span> Driver SPI — Mestre Full-Duplex</h1>
+<p class="subtitle">Configura o <code>SPI1</code> como mestre com NSS por software e depois corre a clássica troca de bytes por sondagem (polling): esperar <code>TXE</code> → escrever <code>DR</code> → esperar <code>RXNE</code> → ler <code>DR</code>. Este é o último módulo de programação — e um dos poucos periféricos em que o QEMU te deixa reler a tua configuração.</p>
+
+<div class="box note">
+  <span class="box-title">Dependências</span>
+  Este módulo reutiliza o retarget de <code>printf</code> sobre UART por sondagem do <a href="../06-uart-transmit/06-uart-transmit-pt.html">Módulo 06</a> para narrar o progresso, e a configuração de função alternativa dos GPIO do <a href="../04-gpio-output/04-gpio-output-pt.html">Módulo 04</a> (<code>CRL/CRH</code>). A disciplina de espera limitada é a mesma que foi introduzida para os periféricos não emulados nos Módulos 09–12.
+</div>
+
+<!-- ============================== THEORY ============================== -->
+<span class="section-tag">Teoria</span>
+<h2>1. O que é o SPI</h2>
+
+<p>A <strong>S</strong>erial <strong>P</strong>eripheral <strong>I</strong>nterface é um barramento síncrono, <strong>full-duplex</strong>, mestre/escravo. Ao contrário do I²C (que tem endereçamento e é half-duplex), o SPI usa uma linha de chip-select dedicada por escravo e quatro sinais:</p>
+
+<table>
+  <tr><th>Sinal</th><th>Direção (a partir do mestre)</th><th>Pino SPI1</th><th>Significado</th></tr>
+  <tr><td><code>SCK</code></td><td>saída</td><td><code>PA5</code></td><td>Relógio série — o mestre gera-o sempre</td></tr>
+  <tr><td><code>MISO</code></td><td>entrada</td><td><code>PA6</code></td><td>Master In, Slave Out — a linha de resposta do escravo</td></tr>
+  <tr><td><code>MOSI</code></td><td>saída</td><td><code>PA7</code></td><td>Master Out, Slave In — a linha de dados do mestre</td></tr>
+  <tr><td><code>NSS</code></td><td>saída</td><td>(software aqui)</td><td>Seleção de escravo / chip-select, ativo a baixo</td></tr>
+</table>
+
+<p>Não há <strong>endereçamento</strong> no barramento — escolhes com que escravo estás a falar puxando o seu chip-select para baixo. Os bits são deslocados para fora com o <strong>MSB primeiro</strong> por omissão (a ordem dos bits é selecionável via <code>LSBFIRST</code>).</p>
+
+<h3>1.1 Full-duplex significa que TX e RX acontecem em simultâneo</h3>
+<p>O SPI é construído a partir de dois registos de deslocamento (shift registers), um no mestre e um no escravo, ligados em anel por <code>MOSI</code> e <code>MISO</code> e relogiados por <code>SCK</code>:</p>
+
+<div class="diagram">  MESTRE                              ESCRAVO
+  +-----------------+   MOSI          +-----------------+
+  |  shift reg  >>--|---------------->|--&gt;  shift reg   |
+  |       ^         |   MISO          |        |        |
+  |       |---------|&lt;----------------|--------+        |
+  +-------|---------+   SCK ------&gt;   +-----------------+
+          um pulso de SCK desloca UM bit em cada sentido
+
+  Envia um byte e RECEBES um byte nos mesmos 8 ciclos.</div>
+
+<p>Cada trama relogiada desloca um bit de TX para fora <em>e</em> um bit de RX para dentro. Por isso uma "transmissão" e uma "receção" são a mesma operação: para ler de um escravo tens à mesma de fazer sair (clock out) um byte (fictício), e para escrever recebes à mesma de volta aquilo que o escravo calhou pôr em <code>MISO</code>.</p>
+
+<h3>1.2 Modos de relógio: CPOL e CPHA</h3>
+<p>Mestre e escravo têm de concordar no nível de repouso do relógio e em que flanco os dados são amostrados. Dois bits em <code>CR1</code> selecionam um de quatro modos:</p>
+
+<table>
+  <tr><th>Modo</th><th>CPOL</th><th>CPHA</th><th>SCK em repouso</th><th>Dados amostrados no</th></tr>
+  <tr><td>0</td><td><code>0</code></td><td><code>0</code></td><td>baixo</td><td>primeiro flanco (subida)</td></tr>
+  <tr><td>1</td><td><code>0</code></td><td><code>1</code></td><td>baixo</td><td>segundo flanco (descida)</td></tr>
+  <tr><td>2</td><td><code>1</code></td><td><code>0</code></td><td>alto</td><td>primeiro flanco (descida)</td></tr>
+  <tr><td>3</td><td><code>1</code></td><td><code>1</code></td><td>alto</td><td>segundo flanco (subida)</td></tr>
+</table>
+<p><strong>CPOL</strong> define a polaridade de repouso de <code>SCK</code>; <strong>CPHA</strong> escolhe se os dados são capturados no primeiro ou no segundo flanco de relógio de cada bit. O modo 0 (ambos a zero) é o valor por omissão mais comum — é o que usamos aqui.</p>
+
+<h3>1.3 Os registos do SPI1</h3>
+<p>O SPI1 reside em <code>0x40013000</code> no barramento APB2 (RM0041 §25). É um periférico pequeno — apenas quatro registos interessam aqui:</p>
+
+<table>
+  <tr><th>Registo</th><th>Endereço</th><th>Bits-chave</th></tr>
+  <tr><td><code>SPI1_CR1</code></td><td><code>0x40013000</code></td><td>bit0 <code>CPHA</code>, bit1 <code>CPOL</code>, bit2 <code>MSTR</code>, bits[5:3] <code>BR</code>, bit6 <code>SPE</code>, bit7 <code>LSBFIRST</code>, bit8 <code>SSI</code>, bit9 <code>SSM</code>, bit11 <code>DFF</code></td></tr>
+  <tr><td><code>SPI1_CR2</code></td><td><code>0x40013004</code></td><td>ativações de interrupção / DMA / saída SS (não usado aqui)</td></tr>
+  <tr><td><code>SPI1_SR</code></td><td><code>0x40013008</code></td><td>bit0 <code>RXNE</code>, bit1 <code>TXE</code>, bit7 <code>BSY</code></td></tr>
+  <tr><td><code>SPI1_DR</code></td><td><code>0x4001300C</code></td><td>registo de dados (escrita → TX, leitura → RX)</td></tr>
+</table>
+
+<p>Os bits interessantes de <code>CR1</code>:</p>
+<ul>
+  <li><code>MSTR</code> (bit 2) — 1 = modo mestre (geramos o <code>SCK</code>).</li>
+  <li><code>BR[5:3]</code> — prescaler de baud-rate: divide o relógio do APB2 (8 MHz aqui) por 2, 4, 8, 16, … até 256 (<code>000</code>…<code>111</code>). Usamos <code>011</code> = ÷16 → <code>SCK</code> de 500 kHz.</li>
+  <li><code>SPE</code> (bit 6) — ativação do periférico SPI. Define este <strong>por último</strong>, depois de tudo o resto estar configurado.</li>
+  <li><code>SSM</code> (bit 9) + <code>SSI</code> (bit 8) — <strong>gestão de escravo por software</strong>. Com <code>SSM=1</code> o pino NSS de hardware é ignorado e o nível interno de NSS vem antes do <code>SSI</code>. Um mestre <em>tem</em> de ver o seu NSS mantido a alto, por isso também pomos <code>SSI=1</code>.</li>
+  <li><code>DFF</code> (bit 11) — formato de trama de dados: 0 = 8 bits, 1 = 16 bits. Usamos 8 bits.</li>
+  <li><code>LSBFIRST</code> (bit 7) — 0 = MSB primeiro (por omissão), 1 = LSB primeiro.</li>
+</ul>
+
+<div class="box danger">
+  <span class="box-title">⚠ O modo mestre precisa de SSM + SSI (ou de um NSS real)</span>
+  Em modo mestre, se o pino NSS de hardware puder ir a baixo, o periférico SPI pensa que outro mestre tomou o barramento, limpa <code>MSTR</code> e levanta uma falha de modo (MODF). Quando não estás a ligar um NSS de hardware, <strong>tens</strong> de definir <code>SSM=1</code> (gerir NSS por software) e <code>SSI=1</code> (manter o NSS interno a alto) para que o mestre continue mestre. Esquecer isto é o clássico bug "o SPI configura e morre logo a seguir".
+</div>
+
+<h3>1.4 Sequência de arranque</h3>
+<ol>
+  <li>Ativa o relógio do <code>SPI1</code> (<code>RCC_APB2ENR</code> bit 12, <code>SPI1EN</code>) e o relógio do GPIOA.</li>
+  <li>Configura <code>PA5</code>/<code>PA6</code>/<code>PA7</code> como função alternativa push-pull para que o SPI1 fique dono dos pinos.</li>
+  <li>Escreve <code>CR1</code>: <code>MSTR | SSM | SSI | BR | SPE</code> (com <code>CPOL=CPHA=0</code>, <code>DFF=0</code>, <code>LSBFIRST=0</code>).</li>
+</ol>
+<p>Depois, para cada byte: esperar <code>TXE</code> → escrever <code>DR</code> → esperar <code>RXNE</code> → ler <code>DR</code>.</p>
+
+<div class="box warn">
+  <span class="box-title">O que o QEMU mostra — o SPI é apenas PARCIALMENTE emulado</span>
+  A máquina <code>stm32vldiscovery</code> no QEMU emula os <em>registos</em> do SPI1 mas <strong>não liga nenhum dispositivo escravo</strong> (não há ADXL345, não há flash, nada em <code>MISO</code>). Concretamente:
+  <ul>
+    <li><code>CR1</code> <strong>relê</strong> o valor que escreveste — por isso, ao contrário do GPIO e do I²C, podes mesmo <em>provar</em> que a tua configuração ficou. Imprimimo-lo.</li>
+    <li>Os flags de estado <code>TXE</code> e <code>RXNE</code> são reportados como ativos, por isso o fluxo de sondagem avança e o programa não congela.</li>
+    <li>Mas qualquer byte que "recebas" lendo <code>DR</code> não tem <strong>significado</strong> — nada controla o <code>MISO</code>. Em hardware real, com um escravo real selecionado, essa leitura devolve o byte que o escravo fez sair de volta.</li>
+  </ul>
+  Continuas a usar <strong>esperas limitadas</strong> (um contador de guarda) em cada flag, de acordo com a regra do curso, para que um flag que nunca se ative jamais possa pendurar o programa.
+</div>
+
+<!-- ============================== EXERCISE ============================== -->
+<span class="section-tag">Exercício Guiado</span>
+<h2>2. Mestre SPI1 + uma transferência full-duplex</h2>
+
+<p><strong>Objetivo:</strong> terminar <code>spi1_init()</code> e <code>spi_transfer()</code>, e depois ver o <code>main()</code> imprimir a releitura de <code>CR1</code> e os bytes recebidos (sem significado no QEMU). Vais:</p>
+<ol>
+  <li>Ativar os relógios do SPI1 + GPIOA e pôr <code>PA5/6/7</code> em AF push-pull.</li>
+  <li>Compor <code>CR1</code> a partir dos bits certos e ativar o periférico por último.</li>
+  <li>Implementar a transferência por sondagem com duas esperas de flag <strong>limitadas</strong>.</li>
+</ol>
+
+<h3>2.1 Esqueleto — cria <code>13-spi/main.c</code></h3>
+<p>Preenche cada <code>TODO</code>. A canalização de UART/<code>printf</code> está fornecida (é idêntica à do Módulo 06) para que te possas concentrar na lógica do SPI. Não olhes para a solução de referência antes de teres tentado as dicas.</p>
+
+<pre><code>#include &lt;stdint.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;sys/stat.h&gt;
+
+/* ---- RCC ---- */
+#define RCC_APB2ENR  (*(volatile uint32_t *)0x40021018U)
+#define RCC_IOPAEN   (1U &lt;&lt; 2)
+#define RCC_USART1EN (1U &lt;&lt; 14)
+#define RCC_SPI1EN   (1U &lt;&lt; 12)   /* APB2 bit12 */
+
+/* ---- GPIOA ---- */
+#define GPIOA_CRL    (*(volatile uint32_t *)0x40010800U)  /* pinos 0-7  */
+#define GPIOA_CRH    (*(volatile uint32_t *)0x40010804U)  /* pinos 8-15 */
+/* PA5/6/7 pinos SPI1, AF push-pull (nibble 0xB) nos shifts 20/24/28 */
+#define SPI_PINS_MASK (((uint32_t)0xFU&lt;&lt;20)|((uint32_t)0xFU&lt;&lt;24)|((uint32_t)0xFU&lt;&lt;28))
+#define SPI_PINS_AF   (((uint32_t)0xBU&lt;&lt;20)|((uint32_t)0xBU&lt;&lt;24)|((uint32_t)0xBU&lt;&lt;28))
+/* PA9 = USART1 TX (AF push-pull) */
+#define PA9_CRH_MASK (0xFU &lt;&lt; 4)
+#define PA9_CRH_AF   (0xBU &lt;&lt; 4)
+
+/* ---- USART1 (narração do printf) ---- */
+#define USART1_SR    (*(volatile uint32_t *)0x40013800U)
+#define USART1_DR    (*(volatile uint32_t *)0x40013804U)
+#define USART1_BRR   (*(volatile uint32_t *)0x40013808U)
+#define USART1_CR1   (*(volatile uint32_t *)0x4001380CU)
+#define USART_SR_TXE (1U &lt;&lt; 7)
+
+/* ---- SPI1 ---- */
+#define SPI1_CR1     (*(volatile uint32_t *)0x40013000U)
+#define SPI1_SR      (*(volatile uint32_t *)0x40013008U)
+#define SPI1_DR      (*(volatile uint32_t *)0x4001300CU)
+#define SPI_CR1_CPHA (1U &lt;&lt; 0)
+#define SPI_CR1_CPOL (1U &lt;&lt; 1)
+#define SPI_CR1_MSTR (1U &lt;&lt; 2)
+#define SPI_CR1_BR_DIV16 (0x3U &lt;&lt; 3)   /* BR[5:3] = 011 -&gt; fPCLK/16 */
+#define SPI_CR1_SPE  (1U &lt;&lt; 6)
+#define SPI_CR1_SSI  (1U &lt;&lt; 8)
+#define SPI_CR1_SSM  (1U &lt;&lt; 9)
+#define SPI_CR1_DFF  (1U &lt;&lt; 11)
+#define SPI_SR_RXNE  (1U &lt;&lt; 0)
+#define SPI_SR_TXE   (1U &lt;&lt; 1)
+#define WAIT_GUARD   (100000U)
+
+static void uart_putc(uint8_t c) {
+    while ((USART1_SR &amp; USART_SR_TXE) == 0U) { }
+    USART1_DR = (uint32_t)c;
+}
+int _write(int fd, const char *buf, int len) {
+    (void)fd;
+    for (int i = 0; i &lt; len; i++) {
+        if (buf[i] == '\n') { uart_putc((uint8_t)'\r'); }
+        uart_putc((uint8_t)buf[i]);
+    }
+    return len;
+}
+int _read(int f,char*b,int l){(void)f;(void)b;(void)l;return 0;}
+int _close(int f){(void)f;return -1;}
+int _lseek(int f,int o,int d){(void)f;(void)o;(void)d;return 0;}
+int _isatty(int f){(void)f;return 1;}
+int _fstat(int f,struct stat*s){(void)f;if(s)s-&gt;st_mode=S_IFCHR;return 0;}
+
+static void uart_init(void) {
+    RCC_APB2ENR |= (RCC_IOPAEN | RCC_USART1EN);
+    GPIOA_CRH = (GPIOA_CRH &amp; ~PA9_CRH_MASK) | PA9_CRH_AF;
+    USART1_BRR = 0x341U;
+    USART1_CR1 = (1U &lt;&lt; 3) | (1U &lt;&lt; 13);   /* TE | UE */
+}
+
+static void spi1_init(void)
+{
+    /* TODO 1: ativa os relogios do SPI1 (APB2 bit12) e do GPIOA em RCC_APB2ENR */
+
+    /* TODO 2: poe PA5/PA6/PA7 em AF push-pull em GPIOA_CRL
+     *         (limpa SPI_PINS_MASK, faz OR com SPI_PINS_AF) */
+
+    /* TODO 3: escreve SPI1_CR1 = MSTR | SSM | SSI | BR(div16) | SPE
+     *         (deixa CPOL, CPHA, DFF, LSBFIRST = 0).
+     *         Lembra-te: SPE entra nesta mesma escrita, e SSM+SSI sao
+     *         OBRIGATORIOS para um mestre com NSS por software. */
+}
+
+static uint8_t spi_transfer(uint8_t tx)
+{
+    uint32_t guard;
+
+    /* TODO 4: espera limitada ate SPI_SR_TXE estar ativo (espaco para escrever).
+     *         guard = WAIT_GUARD; while (TXE==0 &amp;&amp; guard&gt;0) guard--; */
+
+    /* TODO 5: escreve o byte em SPI1_DR (isto arranca o relogio) */
+
+    /* TODO 6: espera limitada ate SPI_SR_RXNE estar ativo (chegou uma trama) */
+
+    /* TODO 7: le SPI1_DR e devolve-o (cast para uint8_t).
+     *         No QEMU este byte nao tem significado (sem escravo). */
+    return 0U; /* substitui pela leitura de DR */
+}
+
+int main(void)
+{
+    uint8_t rx;
+    uart_init();
+    (void)setvbuf(stdout, NULL, _IONBF, 0);
+
+    printf("\n=== Module 13: SPI Driver ===\n");
+    spi1_init();
+
+    /* CR1 rele-se no QEMU - prova que a config ficou */
+    printf("SPI1_CR1 read-back = 0x%08X\n", (unsigned int)SPI1_CR1);
+
+    rx = spi_transfer(0x9FU);
+    printf("  sent 0x9F -&gt; received 0x%02X\n", (unsigned int)rx);
+    rx = spi_transfer(0xABU);
+    printf("  sent 0xAB -&gt; received 0x%02X\n", (unsigned int)rx);
+    printf("=== done; SPI idle ===\n");
+
+    for (;;) { }
+    return 0;
+}
+</code></pre>
+
+<h3>2.2 Compilar e correr</h3>
+<p>De dentro da pasta <code>13-spi/</code>:</p>
+<pre><code>make -f ../common/Makefile SRC=main.c run</code></pre>
+<p>Deverás ver o banner, uma releitura de <code>SPI1_CR1</code> não-nula, duas linhas de transferência e <code>=== done ===</code>. Sai do QEMU com <kbd>Ctrl-A</kbd> e depois <kbd>X</kbd>. Sucesso: <strong>compila sem avisos, imprime a releitura de CR1 e não pendura</strong>.</p>
+
+<div class="box ok">
+  <span class="box-title">Releitura esperada de CR1</span>
+  Com <code>MSTR | SSM | SSI | BR=÷16 | SPE</code> o valor é
+  <code>0x4 | 0x200 | 0x100 | 0x18 | 0x40 = 0x35C</code>. O QEMU imprime
+  <code>SPI1_CR1 read-back = 0x0000035C</code> — prova concreta de que os teus bits ficaram. Os bytes recebidos imprimem-se como <code>0x00</code> (sem significado: nenhum escravo controla o MISO).
+</div>
+
+<h3>2.3 Dicas</h3>
+<details class="hint">
+  <summary>Dica 1 — relógios e pinos</summary>
+  <p><code>RCC_APB2ENR |= (RCC_SPI1EN | RCC_IOPAEN);</code> e depois
+  <code>GPIOA_CRL = (GPIOA_CRL &amp; ~SPI_PINS_MASK) | SPI_PINS_AF;</code>. Como sempre, um periférico sem relógio ignora silenciosamente as escritas.</p>
+</details>
+<details class="hint">
+  <summary>Dica 2 — compor CR1 (não te esqueças do SSM + SSI)</summary>
+  <p>Uma escrita resolve tudo:
+  <code>SPI1_CR1 = SPI_CR1_MSTR | SPI_CR1_SSM | SPI_CR1_SSI | SPI_CR1_BR_DIV16 | SPI_CR1_SPE;</code>.
+  Deixar de fora <code>SSM</code>/<code>SSI</code> tira o mestre do modo mestre. <code>SPE</code> é definido na mesma escrita (não há problema aqui porque mais nada precisa de acontecer primeiro).</p>
+</details>
+<details class="hint">
+  <summary>Dica 3 — esperas de flag limitadas (nunca girar para sempre)</summary>
+  <p>Padrão para ambas as esperas:
+  <code>guard = WAIT_GUARD; while (((SPI1_SR &amp; SPI_SR_TXE) == 0U) &amp;&amp; (guard &gt; 0U)) { guard--; }</code>.
+  Repete com <code>SPI_SR_RXNE</code> para o lado da receção. A guarda só importa se um flag nunca se ativar; em hardware real o ciclo sai cedo.</p>
+</details>
+<details class="hint">
+  <summary>Dica 4 — escrever e depois ler DR</summary>
+  <p>Escrever <code>SPI1_DR = (uint32_t)tx;</code> lança a troca relogiada. Depois de <code>RXNE</code> estar ativo, <code>return (uint8_t)SPI1_DR;</code> lê o byte recebido e limpa <code>RXNE</code>.</p>
+</details>
+
+<div class="box ok">
+  <span class="box-title">Solução de referência</span>
+  Solução completa e comentada: <code>solutions/13-spi.c</code>. Tenta primeiro todas as dicas.
+</div>
+
+<!-- ============================== QUESTIONS ============================== -->
+<span class="section-tag">Perguntas de Verificação</span>
+<h2>3. Verifica a tua compreensão</h2>
+
+<details class="answer">
+  <summary>P1. O que controlam o CPOL e o CPHA, cada um, e o que é o "modo 0"?</summary>
+  <p><code>CPOL</code> define o nível de repouso de <code>SCK</code> (0 = repouso a baixo, 1 = repouso a alto). <code>CPHA</code> seleciona em que flanco de relógio de cada período de bit os dados são amostrados (0 = primeiro flanco, 1 = segundo flanco). O modo 0 é <code>CPOL=0, CPHA=0</code>: o relógio repousa a baixo e os dados são amostrados no primeiro flanco (de subida). Mestre e escravo têm de usar o mesmo modo ou cada byte sai corrompido.</p>
+</details>
+<details class="answer">
+  <summary>P2. Porque é que um mestre com NSS por software tem de definir tanto SSM como SSI?</summary>
+  <p>Em modo mestre o SPI observa a sua entrada NSS. Se o NSS for a baixo, assume que outro mestre tomou o barramento, limpa <code>MSTR</code> e sinaliza uma falha de modo, parando assim as transferências. Sem nenhum NSS de hardware ligado, defines <code>SSM=1</code> para dizer ao periférico para ignorar o pino físico NSS e usar antes o nível interno de <code>SSI</code>, e <code>SSI=1</code> para manter esse NSS interno a alto — mantendo o mestre como mestre.</p>
+</details>
+<details class="answer">
+  <summary>P3. O que significa "full-duplex" aqui — como pode uma transferência enviar e receber ao mesmo tempo?</summary>
+  <p>O SPI é um anel de dois registos de deslocamento (mestre + escravo) ligados por <code>MOSI</code> e <code>MISO</code> e acionados por um <code>SCK</code> partilhado. Cada flanco de relógio desloca um bit para fora do mestre em <code>MOSI</code> e um bit para dentro vindo do escravo em <code>MISO</code> em simultâneo. Ao fim de 8 ciclos o mestre enviou um byte <em>e</em> recebeu um byte. É por isso que uma "leitura" continua a fazer sair um byte fictício e uma "escrita" continua a render um byte recebido — transmissão e receção são a mesma operação física.</p>
+</details>
+<details class="answer">
+  <summary>P4. O que faz o campo BR, e que frequência de SCK dá o ÷16 aqui?</summary>
+  <p><code>BR[5:3]</code> é o prescaler de baud-rate. Divide o relógio de barramento do SPI (APB2 = 8 MHz nesta placa no reset) por uma potência de dois, de 2 (<code>000</code>) até 256 (<code>111</code>). Usamos <code>011</code> = ÷16, dando <code>SCK</code> = 8 MHz / 16 = 500 kHz. Escolhes o maior divisor (relógio mais lento) que o escravo tolera, ou um rápido se ele conseguir acompanhar.</p>
+</details>
+<details class="answer">
+  <summary>P5. Os bytes recebidos imprimem-se como 0x00 no QEMU. O código está errado?</summary>
+  <p>Não. O QEMU emula os <em>registos</em> do SPI1 (até consegues reler o <code>CR1</code> como <code>0x35C</code>) e ativa os flags <code>TXE</code>/<code>RXNE</code> para que o fluxo de sondagem corra, mas <strong>não liga nenhum dispositivo escravo</strong> — nada controla o <code>MISO</code>. Por isso o byte recebido não carrega dados reais e relê-se como <code>0x00</code>. Em hardware real com um escravo selecionado (por exemplo, um ADXL345 a responder a uma leitura de registo), esse mesmo código devolve a resposta do escravo.</p>
+</details>
+<details class="answer">
+  <summary>P6. O que seleciona o DFF, e porque é que o deixámos a 0?</summary>
+  <p><code>DFF</code> (bit 11) escolhe o tamanho da trama: 0 = 8 bits, 1 = 16 bits. Muitos dispositivos e protocolos SPI são orientados a bytes, por isso as tramas de 8 bits são o valor por omissão comum e combinam com a nossa função auxiliar de transferência <code>uint8_t</code>. Define <code>DFF=1</code> só quando um dispositivo espera palavras de 16 bits; o <code>DFF</code> não deve ser alterado enquanto o SPI estiver ativo e ocupado.</p>
+</details>
+
+<div class="box ok">
+  <span class="box-title">🎓 Fim da via de programação</span>
+  Este foi o último módulo ao nível dos registos. Conduziste GPIO, UART, SysTick, temporizadores, o NVIC, DMA, I²C e SPI em bare metal — sem HAL, sem CMSIS, apenas o manual de referência e ponteiros <code>volatile</code>. Volta ao <a href="../README-pt.md">início do curso</a> para os próximos passos e as ideias de projeto.
+</div>
+
+<div class="modfooter">
+  <a href="../12-i2c/12-i2c-pt.html">← 12 · I²C</a>
+  <span class="disabled">Fim do curso</span>
+</div>
+
+</div>
+</body>
+</html>

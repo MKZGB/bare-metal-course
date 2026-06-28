@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · Memory-Mapped Registers — Bare-Metal STM32</title>
+<link rel="stylesheet" href="../common/style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <a href="../README.md">Home</a>
+  <a href="../glossary.html">Glossary</a>
+  <a href="../02-arm-programmer-model/02-arm-programmer-model.html">‹ Prev</a>
+  <a href="../04-gpio-output/04-gpio-output.html">Next ›</a>
+  <a href="03-memory-mapped-registers-pt.html">🌐 Português</a>
+  <span class="spacer"></span>
+  <span class="badge">STM32F100RBT6 · RM0041</span>
+</nav>
+
+<div class="wrap">
+
+<h1><span class="modnum">Module 03</span> Memory-Mapped Registers (MMIO)</h1>
+<p class="subtitle">How peripheral hardware appears as memory addresses, why <code>volatile</code> is non-negotiable, and how to model a register block as a C struct. This is the foundation every later module reuses.</p>
+
+<div class="box note">
+  <span class="box-title">What this module gives you</span>
+  No LED, no UART, no visible output yet — this is a <strong>design</strong> module. You will learn the two ways to name a hardware register in C, the bit-manipulation idioms used everywhere in this course, and you will hand-write a small register-map header for GPIO port C. Modules 04 onward assume you are fluent with everything here.
+</div>
+
+<!-- ============================== THEORY ============================== -->
+<span class="section-tag">Theory</span>
+<h2>1. What "memory-mapped I/O" means</h2>
+
+<p>A Cortex-M3 has a single, flat <strong>4&nbsp;GB address space</strong> (addresses <code>0x00000000</code>–<code>0xFFFFFFFF</code>). Some of those addresses are real memory — Flash and SRAM. But large regions of the map are not memory at all: they are wired directly to <strong>peripheral hardware</strong>. Reading or writing one of those addresses does not store a value; it pokes a circuit.</p>
+
+<p>This is <strong>memory-mapped I/O (MMIO)</strong>. There is no separate "I/O instruction" on ARM (unlike x86 <code>IN</code>/<code>OUT</code>). To turn on an LED you write to an address; to read a button you read an address. A <em>register</em> is just a named 32-bit location inside a peripheral that controls or reports something.</p>
+
+<div class="diagram">STM32F100 address space (the parts that matter)
+
+  0xFFFFFFFF  +---------------------------+
+              |   ...                     |
+  0xE000E000  |  Cortex-M3 core periph.   |  NVIC, SysTick   (PM0056)
+              |   ...                     |
+  0x40018000  +---------------------------+
+              |  AHB peripherals          |  RCC @0x40021000, DMA @0x40020000
+  0x40010000  +---------------------------+
+              |  APB2 peripherals         |  GPIOA..D, USART1, SPI1, ADC, AFIO
+  0x40000000  +---------------------------+
+              |  APB1 peripherals         |  TIM2..4, USART2/3, I2C, SPI2
+              +---------------------------+
+              |   ... (unmapped) ...      |
+  0x20000000  +---------------------------+
+              |  SRAM   (8 KB)            |  variables, stack
+  0x08000000  +---------------------------+
+              |  Flash  (128 KB)          |  your code + constants
+  0x00000000  +---------------------------+</div>
+
+<p>Three landmarks worth memorizing (RM0041 §3 / PM0056):</p>
+<table>
+  <tr><th>Region</th><th>Base address</th><th>Holds</th></tr>
+  <tr><td>APB1 peripherals</td><td><code>0x40000000</code></td><td>TIM2–4, USART2/3, I2C1/2, SPI2</td></tr>
+  <tr><td>APB2 peripherals</td><td><code>0x40010000</code></td><td>GPIOA–D, USART1, SPI1, ADC1, AFIO</td></tr>
+  <tr><td>AHB peripherals</td><td><code>0x40018000</code>+</td><td>RCC (<code>0x40021000</code>), DMA1 (<code>0x40020000</code>)</td></tr>
+  <tr><td>Cortex-M3 core</td><td><code>0xE000E000</code></td><td>NVIC, SysTick (part of the CPU, not the chip vendor)</td></tr>
+</table>
+
+<p>Each peripheral occupies a fixed slice of this space, and inside that slice each register sits at a fixed <strong>offset</strong> from the peripheral's base. For example GPIO port C has base <code>0x40011000</code>, and its output-data register <code>ODR</code> is at offset <code>0x0C</code>, i.e. absolute address <code>0x4001100C</code>. The reference manual (RM0041) is the authority for every base and offset.</p>
+
+<h2>2. Why <code>volatile</code> is mandatory</h2>
+
+<p>The C compiler assumes ordinary variables behave like memory: if you read the same address twice with nothing in between, the value cannot have changed, so it is free to read once and reuse the cached copy. It is also free to drop a write that is immediately overwritten, or to reorder independent reads/writes. Those optimizations are <strong>correct for RAM and catastrophic for hardware registers</strong>, whose value can change on its own and whose every access has a side effect.</p>
+
+<p>The <code>volatile</code> qualifier tells the compiler: <em>this location may change at any time, every access is observable, do exactly the accesses I wrote, in order, no caching, no eliding, no reordering relative to other volatile accesses.</em></p>
+
+<div class="box danger">
+  <span class="box-title">⚠ The classic infinite-loop bug</span>
+  Suppose you poll a "data ready" flag in a status register. Without <code>volatile</code> the compiler reads the register <strong>once</strong>, sees the bit is 0, and — because nothing in the loop changes it — turns your poll into <code>while (1) { }</code>. The hardware sets the bit a microsecond later, but your program never looks again. It hangs forever.
+<pre><code>/* BROKEN: plain pointer, no volatile */
+uint32_t *sr = (uint32_t *)0x40013800U;   /* USART1_SR */
+while ((*sr &amp; (1U &lt;&lt; 5)) == 0U) { }        /* wait for RXNE */
+/* compiler hoists the read out of the loop -> spins on a stale 0 forever */</code></pre>
+The fix is one keyword:
+<pre><code>/* CORRECT: volatile forces a real bus read every iteration */
+volatile uint32_t *sr = (volatile uint32_t *)0x40013800U;
+while ((*sr &amp; (1U &lt;&lt; 5)) == 0U) { }        /* re-reads hardware each pass */</code></pre>
+The same reasoning applies to writes: without <code>volatile</code> a compiler may drop a write you "never read back," even though that write is exactly what flips a hardware bit.
+</div>
+
+<p><strong>Rule for this course:</strong> every pointer that names a hardware register is <code>volatile</code>. We use fixed-width types (<code>uint32_t</code>) so the access width matches the 32-bit register exactly.</p>
+
+<h2>3. Two ways to name a register in C</h2>
+
+<h3>3.1 Idiom A — the <code>#define</code> macro</h3>
+<p>The simplest approach: cast the literal address to a <code>volatile uint32_t *</code> and dereference it. Wrap it in a macro so the name reads like a variable.</p>
+
+<pre><code>#define GPIOC_ODR  (*(volatile uint32_t *)0x4001100CU)
+
+GPIOC_ODR = 0x200U;      /* writes the 32-bit register */
+uint32_t v = GPIOC_ODR;  /* reads it back               */</code></pre>
+
+<p>Read it inside-out: <code>(volatile uint32_t *)0x4001100CU</code> is "a pointer to a volatile 32-bit value living at that address"; the leading <code>*</code> dereferences it so the macro <em>is</em> the register, usable on either side of <code>=</code>. This is exactly what Module 04 uses. It is fine for one or two registers, but with seven registers per GPIO port and four ports it becomes a wall of hard-coded addresses that are easy to mistype.</p>
+
+<h3>3.2 Idiom B — the <code>volatile</code> struct overlay</h3>
+<p>A peripheral's registers are consecutive 32-bit words at known offsets — which is exactly the memory layout of a C <code>struct</code> of <code>uint32_t</code> fields. So we declare a struct whose fields, <em>in order</em>, mirror the register map, then point it at the peripheral's base address:</p>
+
+<pre><code>typedef struct {
+    volatile uint32_t CRL;    /* offset 0x00 */
+    volatile uint32_t CRH;    /* offset 0x04 */
+    volatile uint32_t IDR;    /* offset 0x08 */
+    volatile uint32_t ODR;    /* offset 0x0C */
+    volatile uint32_t BSRR;   /* offset 0x10 */
+    volatile uint32_t BRR;    /* offset 0x14 */
+    volatile uint32_t LCKR;   /* offset 0x18 */
+} GPIO_TypeDef;
+
+#define GPIOC ((GPIO_TypeDef *)0x40011000U)
+
+GPIOC-&gt;ODR  = 0x200U;     /* address = base + 0x0C automatically */
+GPIOC-&gt;BSRR = (1U &lt;&lt; 9);  /* address = base + 0x10               */</code></pre>
+
+<p>Because each <code>uint32_t</code> is 4 bytes and the compiler lays the fields out contiguously with no padding (all fields are the same naturally-aligned 4-byte type), field offsets become <code>0x00, 0x04, 0x08, …</code> — and the compiler computes <code>base + offset</code> for you. You write <code>GPIOC-&gt;BSRR</code>; the compiler emits a store to <code>0x40011010</code>.</p>
+
+<div class="box danger">
+  <span class="box-title">⚠ The struct must match the hardware map exactly</span>
+  The struct only works because field order and size <em>reproduce the register map byte-for-byte</em>. If you omit a register, reorder two, or use the wrong width, every field after the mistake lands on the wrong address and silently talks to the wrong hardware. There is no compiler check — the struct is just an interpretation laid over raw addresses. When a register map has a gap (a reserved address with no register), you must insert an explicit padding field, e.g. <code>volatile uint32_t RESERVED0;</code>, to keep later offsets aligned. (GPIO has no gaps; you will see padding later in timers/DMA.)
+</div>
+
+<p><strong>Why the struct scales better:</strong> one base address instead of seven literals; field names checked by the compiler (a typo like <code>GPIOC-&gt;OOR</code> fails to compile, whereas a wrong number in a macro compiles happily); the <em>same</em> <code>GPIO_TypeDef</code> describes <em>every</em> port — <code>GPIOA</code>, <code>GPIOB</code>, <code>GPIOC</code>, <code>GPIOD</code> are just four pointers to the one type. This is precisely how vendor CMSIS headers are built. From this module on we prefer the struct idiom.</p>
+
+<h2>4. Bit-manipulation idioms</h2>
+
+<p>Registers pack many independent controls into one 32-bit word, so you rarely write a whole register — you change specific bits while leaving the rest alone. These five idioms cover almost everything in the course. <code>R</code> is a register, <code>n</code> a bit position.</p>
+
+<table>
+  <tr><th>Goal</th><th>Code</th><th>Why</th></tr>
+  <tr><td>Set bit <code>n</code></td><td><code>R |= (1U &lt;&lt; n);</code></td><td>OR with a 1 forces that bit to 1, other bits unchanged.</td></tr>
+  <tr><td>Clear bit <code>n</code></td><td><code>R &amp;= ~(1U &lt;&lt; n);</code></td><td>AND with a 0 in that position forces it to 0, others kept (the <code>~</code> makes a mask of all-1s except bit <code>n</code>).</td></tr>
+  <tr><td>Toggle bit <code>n</code></td><td><code>R ^= (1U &lt;&lt; n);</code></td><td>XOR with 1 flips the bit; XOR with 0 keeps it.</td></tr>
+  <tr><td>Test bit <code>n</code></td><td><code>((R &gt;&gt; n) &amp; 1U)</code></td><td>Shift the bit down to position 0, mask off everything else → 0 or 1.</td></tr>
+  <tr><td>Write a multi-bit field</td><td><code>R = (R &amp; ~(MASK &lt;&lt; s)) | (VAL &lt;&lt; s);</code></td><td>Read-modify-write: clear the field with the inverted mask, then OR in the new value shifted into place.</td></tr>
+</table>
+
+<p>The last one — clearing a field before OR-ing in a new value — is essential because a bare <code>R |= (VAL &lt;&lt; s)</code> can only ever set bits to 1; it cannot turn a stale 1 back to 0. For a 4-bit field (like a GPIO pin's CNF/MODE nibble) the mask is <code>0xFU</code>:</p>
+
+<pre><code>/* set the 4-bit field for pin 9 (in CRH) to value 0x2, untouched elsewhere */
+uint32_t shift = (9U - 8U) * 4U;            /* = 4 */
+GPIOC-&gt;CRH = (GPIOC-&gt;CRH &amp; ~(0xFU &lt;&lt; shift)) /* clear old nibble  */
+           | (0x2U &lt;&lt; shift);               /* OR in new value   */</code></pre>
+
+<div class="box note">
+  <span class="box-title">MISRA-aligned style (used throughout)</span>
+  <ul>
+    <li>Always suffix unsigned literals with <code>U</code>: <code>1U</code>, <code>0xFU</code>. A bare <code>1</code> is a signed <code>int</code>; <code>1 &lt;&lt; 31</code> is undefined behavior, while <code>1U &lt;&lt; 31</code> is well-defined.</li>
+    <li>Use fixed-width types from <code>&lt;stdint.h&gt;</code> (<code>uint32_t</code>, <code>uint8_t</code>) — never bare <code>int</code> for register values.</li>
+    <li>Prefer named masks/shifts over magic numbers, and always read-modify-write so you never clobber unrelated bits.</li>
+  </ul>
+</div>
+
+<h2>5. RCC: clock-gating as a real MMIO example</h2>
+
+<p>Here is MMIO put to work. To save power, every STM32 peripheral powers up with its clock <strong>switched off</strong>, and a clock-less peripheral ignores all register writes — the textbook "my code does nothing" bug. The <strong>RCC</strong> (Reset and Clock Control) block at <code>0x40021000</code> contains the enable bits. To use GPIO port C you first set its clock-enable bit in <code>RCC_APB2ENR</code> (offset <code>0x18</code>):</p>
+
+<table>
+  <tr><th>Register</th><th>Address</th><th>Bit</th><th>Meaning</th></tr>
+  <tr><td><code>RCC_APB2ENR</code></td><td><code>0x40021018</code></td><td>bit 4 — <code>IOPCEN</code></td><td>Clock enable for GPIO port C</td></tr>
+</table>
+<p class="muted">(bit 2 = IOPAEN port A, bit 3 = IOPBEN port B, bit 4 = IOPCEN port C, bit 5 = IOPDEN port D — RM0041 §7.3.7.)</p>
+
+<pre><code>#define RCC_APB2ENR (*(volatile uint32_t *)0x40021018U)
+RCC_APB2ENR |= (1U &lt;&lt; 4);   /* IOPCEN: turn on the port C clock */</code></pre>
+
+<p>This is exactly the "set bit <code>n</code>" idiom from §4, applied to a real register. You will write this line at the top of every GPIO program in the course.</p>
+
+<!-- ============================== EXERCISE ============================== -->
+<span class="section-tag">Guided Exercise</span>
+<h2>6. Build a GPIO register-map header</h2>
+
+<p><strong>Goal:</strong> hand-write the register model for GPIO port C using the struct idiom, then use it to (a) enable the port C clock and (b) configure <code>PC9</code> as a 2&nbsp;MHz push-pull output. You are <em>modeling</em> the hardware correctly; you do not have to make anything blink — that is Module 04. This code previews Module 04 but does it through the cleaner struct interface you just learned.</p>
+
+<div class="box warn">
+  <span class="box-title">QEMU does not emulate GPIO — and that's fine here</span>
+  Per the course's verified QEMU matrix, the <code>stm32vldiscovery</code> machine <strong>does not emulate GPIO at all</strong>: writes to <code>CRL/CRH/ODR/BSRR</code> are silently dropped and reads return <code>0</code>. There is therefore <strong>nothing to observe</strong> in this exercise. That is expected and not the point — the point is to <em>model the registers correctly</em>. You can confirm the file <em>compiles cleanly</em> with the shared Makefile (a worthwhile check that your struct and bit math are syntactically sound). On real STM32 hardware this same code configures the pin for real.
+</div>
+
+<h3>6.1 Skeleton — create <code>03-memory-mapped-registers/main.c</code></h3>
+<p>Fill in every <code>TODO</code>. The struct field offsets and the clock-enable line are the heart of the exercise — work them out from §3 and §5 before peeking at the hints.</p>
+
+<pre><code>#include &lt;stdint.h&gt;
+
+/* ---------------------------------------------------------------
+ * GPIO register block (RM0041 §8.2). Field ORDER and SIZE must
+ * reproduce the hardware map exactly, or every field lands on the
+ * wrong address.
+ *   offset 0x00 CRL   offset 0x10 BSRR
+ *   offset 0x04 CRH   offset 0x14 BRR
+ *   offset 0x08 IDR   offset 0x18 LCKR
+ *   offset 0x0C ODR
+ * --------------------------------------------------------------- */
+typedef struct {
+    /* TODO 1: declare the seven registers as `volatile uint32_t`
+     *         fields, IN ORDER, so their offsets come out as the
+     *         comment block above. (CRL, CRH, IDR, ODR, BSRR, BRR, LCKR) */
+
+} GPIO_TypeDef;
+
+/* TODO 2: define GPIOC as a GPIO_TypeDef* pointing at port C's base.
+ *         Port C base address is 0x40011000 (RM0041 §3.3 memory map). */
+#define GPIOC  /* ... */
+
+/* RCC_APB2ENR holds the peripheral clock-enable bits (offset 0x18). */
+#define RCC_APB2ENR  (*(volatile uint32_t *)0x40021018U)
+#define RCC_IOPCEN   (1U &lt;&lt; 4)   /* bit 4: port C clock enable */
+
+#define LED_PIN  9U              /* LD3 (green) = PC9 */
+
+int main(void)
+{
+    /* TODO 3: enable the GPIO port C clock.
+     *         Set RCC_IOPCEN in RCC_APB2ENR with a read-modify-write OR. */
+
+
+    /* TODO 4: configure PC9 as output push-pull, 2 MHz (nibble = 0x2).
+     *         Pin 9 lives in CRH; its 4-bit field starts at bit
+     *         (LED_PIN - 8) * 4 = 4. Clear that nibble (mask 0xFU),
+     *         then OR in 0x2U, all shifted by the computed amount.
+     *         Use the GPIOC struct pointer: GPIOC-&gt;CRH = ... */
+
+
+    /* Nothing visible happens in QEMU (GPIO not emulated). On real
+     * hardware PC9 is now a configured output. Done. */
+    for (;;)
+    {
+        /* idle */
+    }
+
+    return 0;
+}
+</code></pre>
+
+<h3>6.2 Verify it compiles (optional)</h3>
+<p>There is no runtime behaviour to see, but you can confirm your register model is syntactically sound. From inside the <code>03-memory-mapped-registers/</code> folder:</p>
+<pre><code>make -f ../common/Makefile SRC=main.c</code></pre>
+<p>A clean build with no warnings means your struct, pointer cast, and bit math are well-formed. (Running it in QEMU would just sit in the idle loop — expected.)</p>
+
+<h3>6.3 Hints</h3>
+<details class="hint">
+  <summary>Hint 1 — laying out the struct</summary>
+  <p>Each register is one 32-bit word, so each field is <code>volatile uint32_t</code>. List them top-to-bottom in the same order the offsets increase. The first field sits at offset 0, the next at +4, and so on automatically:</p>
+<pre><code>typedef struct {
+    volatile uint32_t CRL;   /* 0x00 */
+    volatile uint32_t CRH;   /* 0x04 */
+    volatile uint32_t IDR;   /* 0x08 */
+    volatile uint32_t ODR;   /* 0x0C */
+    volatile uint32_t BSRR;  /* 0x10 */
+    volatile uint32_t BRR;   /* 0x14 */
+    volatile uint32_t LCKR;  /* 0x18 */
+} GPIO_TypeDef;</code></pre>
+</details>
+<details class="hint">
+  <summary>Hint 2 — the GPIOC pointer</summary>
+  <p>Cast the base address to your struct-pointer type so <code>GPIOC-&gt;FIELD</code> resolves to <code>base + offset</code>. The <code>U</code> suffix keeps the literal unsigned:</p>
+<pre><code>#define GPIOC  ((GPIO_TypeDef *)0x40011000U)</code></pre>
+</details>
+<details class="hint">
+  <summary>Hint 3 — enabling the clock (TODO 3)</summary>
+  <p>Read-modify-write OR so you don't disturb other enable bits:</p>
+<pre><code>RCC_APB2ENR |= RCC_IOPCEN;</code></pre>
+</details>
+<details class="hint">
+  <summary>Hint 4 — configuring PC9 in CRH (TODO 4)</summary>
+  <p>The nibble for pin 9 is at shift <code>(9 - 8) * 4 = 4</code>. Clear it with the inverted 4-bit mask, then OR in <code>0x2</code> (MODE=10 → output 2&nbsp;MHz, CNF=00 → push-pull), all shifted into place:</p>
+<pre><code>uint32_t shift = (LED_PIN - 8U) * 4U;            /* = 4 */
+GPIOC-&gt;CRH = (GPIOC-&gt;CRH &amp; ~(0xFU &lt;&lt; shift))      /* clear nibble */
+           | (0x2U &lt;&lt; shift);                    /* push-pull, 2 MHz */</code></pre>
+</details>
+
+<div class="box ok">
+  <span class="box-title">No separate solution file for this module</span>
+  This is foundational reference code reused by later modules, so the full answer is revealed through the hints above rather than a <code>solutions/</code> file. Work each hint in order, then compare your <code>main.c</code> to Hints 1–4 combined. Module 04 builds directly on this struct.
+</div>
+
+<!-- ============================== QUESTIONS ============================== -->
+<span class="section-tag">Verification Questions</span>
+<h2>7. Check your understanding</h2>
+
+<details class="answer">
+  <summary>Q1. Why must a register pointer be <code>volatile</code>? Give the failure mode without it.</summary>
+  <p>A hardware register can change on its own (hardware sets/clears bits) and every access has a side effect. Without <code>volatile</code> the compiler treats it like ordinary memory: it may cache a read and reuse the stale value, drop a write it thinks is redundant, or reorder accesses. The classic failure is polling a status flag in a loop — the compiler hoists the read out of the loop, spins on a stale <code>0</code>, and the program hangs forever even though the hardware set the bit. <code>volatile</code> forces a real bus access, in order, for every read and write.</p>
+</details>
+
+<details class="answer">
+  <summary>Q2. How do a struct's field offsets map onto register addresses?</summary>
+  <p>The compiler lays out struct fields contiguously. With seven <code>volatile uint32_t</code> fields (each 4 bytes, naturally aligned, no padding) the offsets are <code>0x00, 0x04, 0x08, 0x0C, 0x10, 0x14, 0x18</code>. When the struct pointer holds the peripheral base address, accessing a field computes <code>base + offset</code>: e.g. <code>GPIOC-&gt;BSRR</code> with base <code>0x40011000</code> and <code>BSRR</code> at offset <code>0x10</code> resolves to address <code>0x40011010</code>. This is why field order and size must mirror the hardware map exactly — and why gaps in the map need explicit padding fields.</p>
+</details>
+
+<details class="answer">
+  <summary>Q3. What is the difference between writing <code>ODR</code> and writing <code>BSRR</code>?</summary>
+  <p><code>ODR</code> is the full 16-bit output-data register; changing one pin means a read-modify-write of <code>ODR</code> (read it, flip one bit, write it back), which can race with an interrupt that modifies another pin in the same port and lose that change. <code>BSRR</code> is write-only and atomic: a single 32-bit write sets the pins whose bit you wrote <code>1</code> to in the low half (bits 0–15) and clears the pins whose bit you wrote <code>1</code> to in the high half (bits 16–31); bits written <code>0</code> are left untouched. So <code>BSRR</code> changes exactly the pins you name, in one bus write, with no read and no race.</p>
+</details>
+
+<details class="answer">
+  <summary>Q4. Why do peripherals power up with their clocks gated off?</summary>
+  <p>Power saving. A clocked digital block draws dynamic current on every clock edge, so leaving unused peripherals unclocked cuts power consumption — important on the low-power microcontrollers this design targets. The side effect for the programmer: a clock-gated peripheral ignores all register writes, so you must enable its clock in the RCC (e.g. set <code>IOPCEN</code> in <code>RCC_APB2ENR</code> for GPIO port C) <em>before</em> configuring it. Forgetting this is the most common "my code runs but nothing happens" bug.</p>
+</details>
+
+<details class="answer">
+  <summary>Q5. GPIO port B has base <code>0x40010C00</code>. Compute the address of <code>GPIOB_ODR</code>.</summary>
+  <p><code>ODR</code> is at offset <code>0x0C</code> in the GPIO register map. So <code>GPIOB_ODR = 0x40010C00 + 0x0C = 0x40010C0C</code>. With the struct idiom you would just write <code>GPIOB-&gt;ODR</code> after defining <code>#define GPIOB ((GPIO_TypeDef *)0x40010C00U)</code>, and the compiler produces that same address for you.</p>
+</details>
+
+<div class="modfooter">
+  <a href="../02-arm-programmer-model/02-arm-programmer-model.html">← 02 · ARM Programmer's Model</a>
+  <a href="../04-gpio-output/04-gpio-output.html">04 · GPIO Output →</a>
+</div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · Modelo de Programação ARM — Bare-Metal STM32</title>
+<link rel="stylesheet" href="../common/style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <a href="../README-pt.md">Início</a>
+  <a href="../glossary-pt.html">Glossário</a>
+  <a href="../01-arm-architecture/01-arm-architecture-pt.html">‹ Anterior</a>
+  <a href="../03-memory-mapped-registers/03-memory-mapped-registers-pt.html">Seguinte ›</a>
+  <a href="02-arm-programmer-model.html">🌐 English</a>
+  <span class="spacer"></span>
+  <span class="badge">STM32F100RBT6 · Cortex-M3 PM0056 · RM0041</span>
+</nav>
+
+<div class="wrap">
+
+<h1><span class="modnum">Módulo 02</span> O Modelo de Programação ARM</h1>
+<p class="subtitle">O núcleo Cortex-M3 tal como o programador o vê: o ficheiro de registos, os registos de estado do programa, os modos de operação e a sequência de reset que transforma um chip frio em código C em execução — percorrido através do <code>startup.c</code> e do <code>linker.ld</code> <em>reais</em> que este curso disponibiliza.</p>
+
+<div class="box note">
+  <span class="box-title">O que é este módulo</span>
+  Este é um <strong>módulo teórico</strong> — não há esqueleto para preencher nem ficheiro <code>solutions/</code>. Em vez disso, vais ler sobre o núcleo e depois executar uma breve investigação contra um ELF compilado <em>real</em> para ver a maquinaria de reset com os teus próprios olhos. Tudo o que está aqui é a base de todos os módulos seguintes: quando o Módulo 04 diz "<code>main()</code> executa", <em>isto</em> é como lá chegou.
+</div>
+
+<!-- ============================== THEORY ============================== -->
+<span class="section-tag">Teoria</span>
+<h2>1. O ficheiro de registos do núcleo (R0–R15)</h2>
+
+<p>O Cortex-M3 é uma máquina load/store: o CPU opera sobre <strong>registos</strong>, e só instruções dedicadas de load/store movem dados de e para a memória. Existem dezasseis registos de núcleo de 32 bits visíveis em qualquer instante. Nem todos são iguais — três deles têm uma função fixa no hardware.</p>
+
+<table>
+  <tr><th>Registo</th><th>Função</th><th>Notas</th></tr>
+  <tr><td><code>R0</code>–<code>R12</code></td><td>Uso geral</td><td>Auxiliares / variáveis. A ABI do C passa os primeiros 4 argumentos inteiros em <code>R0</code>–<code>R3</code> e devolve o resultado em <code>R0</code>.</td></tr>
+  <tr><td><code>R13</code> = <code>SP</code></td><td>Stack Pointer</td><td><strong>Banked</strong>: existem fisicamente dois — <code>MSP</code> (Main) e <code>PSP</code> (Process). Apenas um é "o SP" de cada vez (ver §3).</td></tr>
+  <tr><td><code>R14</code> = <code>LR</code></td><td>Link Register</td><td>Um <code>BL</code> (branch-with-link) guarda aqui o endereço de retorno. À entrada de uma exceção, o CPU escreve um valor especial <code>EXC_RETURN</code> em <code>LR</code>.</td></tr>
+  <tr><td><code>R15</code> = <code>PC</code></td><td>Program Counter</td><td>Endereço da instrução a ser carregada. Escrever nele é um salto. Lê-se sempre com o bit&nbsp;0 = 0, embora as instruções tenham um bit Thumb (ver §5).</td></tr>
+</table>
+
+<h3>1.1 A pilha é full-descending</h3>
+<p>A pilha do Cortex-M3 <strong>cresce para baixo</strong> (em direção a endereços menores) e o <code>SP</code> aponta para o <em>último item empilhado</em> — isto é uma pilha <em>full-descending</em>. Um <code>PUSH</code> decrementa primeiro o <code>SP</code> em 4 e depois guarda; um <code>POP</code> carrega e depois incrementa. É exatamente por isso que o linker define o stack pointer inicial para o <em>topo</em> da RAM: o primeiro push move-o para baixo, para o espaço livre.</p>
+
+<div class="diagram">RAM (8 KB)            0x20002000  &lt;- _estack  (initial MSP, top of RAM)
+                                  |   PUSH r0   -> SP -= 4, then store
+   stack grows DOWN  ===========> |   ...
+                                  v
+                       0x20000000  &lt;- bottom of RAM (.data / .bss live here)</div>
+
+<h2>2. Estado do programa: o xPSR</h2>
+
+<p>As flags de condição, o número da exceção atual e o bit de estado de execução vivem todos num único registo combinado de 32 bits, o <strong>xPSR</strong>. Na verdade são três vistas lógicas do mesmo registo que podes ler/escrever separadamente:</p>
+
+<table>
+  <tr><th>Vista</th><th>Contém</th><th>Campos principais</th></tr>
+  <tr><td><code>APSR</code></td><td>Estado da aplicação — as flags aritméticas</td><td><code>N</code> (negativo), <code>Z</code> (zero), <code>C</code> (carry), <code>V</code> (overflow) e <code>Q</code> (saturação)</td></tr>
+  <tr><td><code>IPSR</code></td><td>Estado de interrupção — <em>qual</em> exceção está em execução</td><td>Número da exceção. <code>0</code> = modo Thread (sem exceção). Dentro de <code>SysTick_Handler</code> lê-se <code>15</code>; dentro de uma IRQ <em>n</em> lê-se <em>16 + n</em>.</td></tr>
+  <tr><td><code>EPSR</code></td><td>Estado de execução</td><td>O <strong>bit <code>T</code></strong> (estado Thumb) e o estado de continuação da instrução interrompida. <code>T</code> tem de ser <code>1</code> num Cortex-M3 — só executa código Thumb.</td></tr>
+</table>
+
+<div class="diagram">xPSR  (bit 31 .................................................. bit 0)
+ |31 30 29 28 27|  ...  |26 ........ 16|  ...  |8 ..... 0|
+ | N  Z  C  V  Q|       |  ICI/IT, T   |       | IPSR #  |
+  \___APSR_____/         \___EPSR_____/         \__IPSR_/</div>
+
+<p>As flags <code>N/Z/C/V</code> são a forma como as comparações em C funcionam: <code>if (a == b)</code> compila para um <code>CMP</code> que define <code>Z</code>, seguido de um branch condicional que o testa. Raramente mexes no xPSR à mão em C — mas tens de compreender o <code>IPSR</code> para saber, dentro de um handler, qual interrupção disparou (abordado nos módulos de interrupções), e o bit <code>T</code> é a razão de um detalhe subtil que verás em §5.</p>
+
+<h2>3. Modos de operação e as duas pilhas</h2>
+
+<p>O Cortex-M3 tem exatamente dois <strong>modos</strong> e dois <strong>níveis de privilégio</strong>:</p>
+
+<table>
+  <tr><th>Eixo</th><th>Estado</th><th>Significado</th></tr>
+  <tr><td rowspan="2">Modo</td><td><strong>Thread</strong></td><td>Código normal — o teu <code>main()</code> e tudo o que ele chama. Entrado no reset.</td></tr>
+  <tr><td><strong>Handler</strong></td><td>A executar um handler de exceção/interrupção. Entrado automaticamente quando uma exceção é tomada; sempre privilegiado.</td></tr>
+  <tr><td rowspan="2">Privilégio</td><td><strong>Privilegiado</strong></td><td>Acesso total a todos os registos especiais e ao System Control Space (NVIC, SysTick, etc.).</td></tr>
+  <tr><td><strong>Não privilegiado</strong></td><td>Restrito; um RTOS pode executar aqui as threads da aplicação. Não consegue alcançar os registos de controlo do núcleo.</td></tr>
+</table>
+
+<p>Qual stack pointer físico está ativo depende do modo e de um bit de controlo:</p>
+<ul>
+  <li><strong>O modo Handler usa sempre o <code>MSP</code>.</strong> Os handlers de exceção executam na pilha principal.</li>
+  <li><strong>O modo Thread usa o <code>MSP</code> por omissão</strong>, mas pode ser comutado para <code>PSP</code> através do bit <code>SPSEL</code> do registo <code>CONTROL</code>.</li>
+</ul>
+
+<div class="box note">
+  <span class="box-title">Porque existem duas pilhas</span>
+  Um RTOS dá a cada tarefa a sua própria pilha via <code>PSP</code>, enquanto os handlers de interrupção executam numa <code>MSP</code> separada controlada pelo kernel — assim uma ISR nunca pode fazer overflow da pilha de uma tarefa, e uma tarefa com pilha esgotada não pode corromper o kernel. <strong>Este curso bare-metal nunca comuta para <code>PSP</code></strong>: vivemos inteiramente em modo Thread privilegiado sobre o <code>MSP</code>. Mas deves saber que o <code>PSP</code> existe, porque a primeira coisa que o hardware faz no reset é carregar o <code>MSP</code> (§4).
+</div>
+
+<h2>4. Do chip frio ao <code>main()</code>: reset e a tabela de vetores</h2>
+
+<p>Não há BIOS nem bootloader a fazer a configuração por ti. Quando o STM32F100 sai do reset, o hardware do Cortex-M3 faz exatamente <strong>duas coisas</strong>, ambas lendo a <strong>tabela de vetores</strong> que está logo no início da Flash, no endereço <code>0x08000000</code>:</p>
+
+<ol>
+  <li><strong>Carrega o <code>MSP</code> inicial</strong> a partir da palavra de 32 bits em <code>0x08000000</code> (entrada de vetor&nbsp;0).</li>
+  <li><strong>Carrega o <code>PC</code></strong> a partir da palavra em <code>0x08000004</code> (entrada de vetor&nbsp;1) e começa a executar aí — esse endereço é o nosso <code>Reset_Handler</code>.</li>
+</ol>
+
+<p>Esse é todo o contributo do hardware. A partir do <code>Reset_Handler</code> em diante, cada byte de configuração é software que nós escrevemos. (RM0041 §10; Cortex-M3 PM0056.)</p>
+
+<h3>4.1 A tabela de vetores em <code>common/startup.c</code></h3>
+<p>A tabela é apenas um array C colocado em <code>0x08000000</code> pelo linker. O detalhe crucial: <strong>a entrada 0 não é um ponteiro para função — é o <em>valor</em> inicial do stack pointer</strong>. Cada entrada seguinte é o endereço de um handler. Aqui está o início de <code>g_vector_table</code> do ficheiro de startup partilhado:</p>
+
+<pre><code>__attribute__((section(".isr_vector"), used))
+void (* const g_vector_table[])(void) =
+{
+    (void (*)(void))(&amp;_estack),  /*   0: Initial Main Stack Pointer       */
+    Reset_Handler,               /*   1: Reset                            */
+    NMI_Handler,                 /*   2: Non-maskable interrupt           */
+    HardFault_Handler,           /*   3: Hard fault                       */
+    MemManage_Handler,           /*   4: Memory management fault          */
+    BusFault_Handler,            /*   5: Bus fault                        */
+    UsageFault_Handler,          /*   6: Usage fault                      */
+    0, 0, 0, 0,                  /* 7-10: Reserved                        */
+    SVC_Handler,                 /*  11: Supervisor call (SVC)            */
+    DebugMon_Handler,            /*  12: Debug monitor                    */
+    0,                           /*  13: Reserved                         */
+    PendSV_Handler,              /*  14: Pendable service request         */
+    SysTick_Handler,             /*  15: System tick timer                */
+    /* index 16+ : the STM32F100 peripheral IRQs (IRQ0 = index 16) ...    */
+};</code></pre>
+
+<p>A disposição é fixada pela arquitetura, não por nós:</p>
+<table>
+  <tr><th>Índice</th><th>Endereço da palavra</th><th>Conteúdo</th></tr>
+  <tr><td><code>0</code></td><td><code>0x08000000</code></td><td><code>MSP</code> inicial = <code>_estack</code> (um <em>valor</em>, não um handler)</td></tr>
+  <tr><td><code>1</code></td><td><code>0x08000004</code></td><td><code>Reset_Handler</code> (o vetor de reset)</td></tr>
+  <tr><td><code>2</code>–<code>6</code></td><td><code>0x08000008</code>+</td><td>NMI, HardFault, MemManage, BusFault, UsageFault</td></tr>
+  <tr><td><code>11</code></td><td><code>0x0800002C</code></td><td>SVC</td></tr>
+  <tr><td><code>14</code>–<code>15</code></td><td><code>0x08000038</code>+</td><td>PendSV, <strong>SysTick</strong> (índice 15)</td></tr>
+  <tr><td><code>16</code>+</td><td><code>0x08000040</code>+</td><td>IRQs de periféricos — a IRQ <em>n</em> está no índice <code>16 + n</code> (WWDG = IRQ0 = índice 16)</td></tr>
+</table>
+
+<p>A tag <code>__attribute__((section(".isr_vector")))</code> coloca este array numa secção com nome que o linker força para o início absoluto da Flash. Em <code>common/linker.ld</code>:</p>
+
+<pre><code>.isr_vector :
+{
+    . = ALIGN(4);
+    KEEP(*(.isr_vector))     /* KEEP = do not garbage-collect: nothing "calls" it */
+    . = ALIGN(4);
+} &gt; FLASH                    /* FLASH ORIGIN = 0x08000000 */</code></pre>
+
+<p>Como <code>.isr_vector</code> é a primeira secção em <code>FLASH</code>, a entrada&nbsp;0 fica exatamente em <code>0x08000000</code> — precisamente onde o hardware procura. O <code>KEEP()</code> impede o garbage collector do linker de descartar a tabela (nenhum código alguma vez a <em>referencia</em>, por isso sem <code>KEEP</code> ela desapareceria).</p>
+
+<h3>4.2 De onde vem <code>_estack</code></h3>
+<p><code>_estack</code> não é uma variável — é um símbolo de linker cujo <em>endereço</em> é o valor que queremos. Do <code>linker.ld</code>:</p>
+
+<pre><code>MEMORY
+{
+    FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 128K
+    RAM   (rwx) : ORIGIN = 0x20000000, LENGTH = 8K
+}
+
+_estack = ORIGIN(RAM) + LENGTH(RAM);   /* 0x20000000 + 0x2000 = 0x20002000 */</code></pre>
+
+<p>Portanto o <code>MSP</code> inicial é <code>0x20002000</code> — uma posição acima do topo da SRAM de 8&nbsp;KB. O primeiro <code>PUSH</code> decrementa-o para <code>0x20001FFC</code> e guarda aí, em segurança dentro da RAM. Vais <strong>verificar este valor exato</strong> no exercício abaixo.</p>
+
+<h3>4.3 O que o <code>Reset_Handler</code> realmente faz</h3>
+<p>Assim que o hardware salta para o <code>Reset_Handler</code>, o software tem de construir o ambiente de execução do C antes de o <code>main()</code> poder correr. Os três passos clássicos de startup, diretamente do <code>startup.c</code>:</p>
+
+<pre><code>void Reset_Handler(void)
+{
+    uint32_t *src;
+    uint32_t *dst;
+
+    /* 1. Copy initialised data: Flash image (_sidata) -&gt; RAM (_sdata.._edata) */
+    src = &amp;_sidata;
+    for (dst = &amp;_sdata; dst &lt; &amp;_edata; )
+    {
+        *dst = *src;
+        dst++;
+        src++;
+    }
+
+    /* 2. Zero-initialise the .bss section. */
+    for (dst = &amp;_sbss; dst &lt; &amp;_ebss; )
+    {
+        *dst = 0U;
+        dst++;
+    }
+
+    /* 3. Hand control to the student's program. */
+    (void)main();
+
+    /* 4. Should never get here on bare metal. */
+    for (;;) { /* trap */ }
+}</code></pre>
+
+<p><strong>Passo 1 — copiar <code>.data</code>.</strong> Um global inicializado como <code>int x = 5;</code> tem um problema: o seu valor inicial (<code>5</code>) tem de sobreviver ao corte de energia, por isso tem de viver na <strong>Flash</strong> não volátil; mas <code>x</code> é escrevível, por isso em tempo de execução tem de viver na <strong>RAM</strong>. O linker resolve isto dando a <code>.data</code> dois endereços — um endereço de <em>load</em> (LMA) na Flash e um endereço de <em>run</em> (VMA) na RAM:</p>
+
+<pre><code>_sidata = LOADADDR(.data);          /* LMA: where the init image sits in Flash */
+
+.data :
+{
+    . = ALIGN(4);
+    _sdata = .;                     /* VMA start: where the variable lives in RAM */
+    *(.data) *(.data*)
+    . = ALIGN(4);
+    _edata = .;                     /* VMA end                                    */
+} &gt; RAM AT &gt; FLASH                   /* run in RAM, load image in FLASH            */</code></pre>
+
+<p>Ao ligar a energia, a RAM contém lixo e os valores iniciais reais estão apenas na Flash. O ciclo do Passo&nbsp;1 copia <code>_edata − _sdata</code> bytes de <code>_sidata</code> (Flash) para <code>_sdata</code> (RAM). Depois de correr, <code>x</code> na RAM é igual a <code>5</code>.</p>
+
+<p><strong>Passo 2 — zerar <code>.bss</code>.</strong> A norma do C diz que os globais não inicializados (<code>int y;</code>) e os explicitamente postos a zero começam a <code>0</code>. Guardar milhares de bytes a zero na Flash seria um desperdício, por isso <code>.bss</code> não ocupa <em>nenhum</em> espaço na imagem — o linker apenas regista a sua extensão na RAM (<code>_sbss</code>…<code>_ebss</code>), e o ciclo de startup escreve zeros sobre essa região.</p>
+
+<p><strong>Passo 3 — chamar <code>main()</code>.</strong> Agora o ambiente do C corresponde ao que o teu código assume (globais inicializados corretos, globais a zero zerados, pilha pronta), por isso é finalmente seguro entrar em <code>main()</code>. Se o <code>main()</code> alguma vez retornar não há SO para onde retornar, por isso o passo&nbsp;4 fica preso num ciclo infinito.</p>
+
+<div class="box warn">
+  <span class="box-title">Não há aqui run-time do C automático</span>
+  Num sistema hospedado (Linux, Windows) o <code>crt0</code> da biblioteca C faz tudo isto por ti antes do <code>main</code>. Em bare metal <em>tu és o <code>crt0</code></em>. É por isso que o Makefile passa <code>-nostartfiles</code> e liga o <code>startup.c</code> explicitamente: não há código de configuração escondido — o que vês em <code>startup.c</code> é a história toda.
+</div>
+
+<!-- ============================== EXERCISE ============================== -->
+<span class="section-tag">Exercício Guiado</span>
+<h2>5. Ler o vetor de reset a partir de um ELF real</h2>
+
+<p><strong>Objetivo:</strong> provar a ti próprio que o <code>MSP</code> inicial e o vetor de reset estão realmente em <code>0x08000000</code>/<code>0x08000004</code> com os valores que a teoria prevê. Vais construir uma imagem de firmware (reutilizando a solução do Módulo 04 como carga útil — a <em>carga útil</em> não importa; a <em>maquinaria de startup</em> é idêntica para cada módulo) e inspecionar a sua tabela de vetores com os GNU binutils.</p>
+
+<h3>5.1 Construir e fazer dump</h3>
+<p>Executa estes comandos a partir da pasta deste módulo. <code>PREFIX</code> aponta para a toolchain bare-metal:</p>
+
+<pre><code>PREFIX=/path/to/arm-gnu-toolchain-13.2.Rel1/bin/arm-none-eabi-
+cd 02-arm-programmer-model
+
+# Build an ELF using the shared Makefile + the module-04 solution as payload.
+make -f ../common/Makefile PREFIX=$PREFIX SRC=../solutions/04-gpio-output.c
+
+# (a) Disassemble: see the entry symbols and their addresses.
+${PREFIX}objdump -d build/firmware.elf | head -40
+
+# (b) Hex-dump the raw vector table section.
+${PREFIX}readelf -x .isr_vector build/firmware.elf</code></pre>
+
+<h3>5.2 O que procurar — a tua tarefa</h3>
+<p>O hex dump do <code>readelf</code> imprime os bytes de <code>.isr_vector</code> começando em <code>0x08000000</code>. Os bytes são mostrados em <strong>little-endian</strong>, por isso uma palavra guardada <code>00 20 00 20</code> lê-se como o valor <code>0x20002000</code>. A tua tarefa:</p>
+
+<ul class="checklist">
+  <li><strong>TODO A:</strong> Encontra a <strong>primeira</strong> palavra de 32 bits (em <code>0x08000000</code>). Este é o <code>MSP</code> inicial. Descodifica-o de little-endian. É igual a <code>_estack</code>?</li>
+  <li><strong>TODO B:</strong> Encontra a <strong>segunda</strong> palavra de 32 bits (em <code>0x08000004</code>). Este é o vetor de reset — o endereço de <code>Reset_Handler</code>. Descodifica-o. Depois confirma que corresponde ao endereço de <code>Reset_Handler</code> impresso pela desmontagem.</li>
+  <li><strong>TODO C:</strong> A palavra do vetor de reset é <em>ímpar</em> (o seu bit mais baixo é 1), mas o endereço de <code>Reset_Handler</code> dado pelo <code>objdump</code> é <em>par</em>. Explica a diferença de um bit (pista: §2, o bit <code>T</code>).</li>
+</ul>
+
+<p>Aqui está um excerto representativo do output real que esta sequência exata de comandos produz (os teus valores de bytes para os handlers podem diferir ligeiramente se a carga útil mudar, mas as palavras 0 e 1 são as que importam):</p>
+
+<pre><code>$ ${PREFIX}readelf -x .isr_vector build/firmware.elf
+
+Hex dump of section '.isr_vector':
+  0x08000000 00200020 81010008 7d010008 7d010008 . . ....}...}...
+  0x08000010 7d010008 7d010008 7d010008 00000000 }...}...}.......
+  0x08000020 00000000 00000000 00000000 7d010008 ............}...
+  0x08000030 7d010008 00000000 7d010008 7d010008 }.......}...}...
+  ...
+
+$ ${PREFIX}objdump -d build/firmware.elf | head -40
+  ...
+08000180 &lt;Reset_Handler&gt;:
+ 8000180:  b508        push  {r3, lr}
+ 8000182:  4b0a        ldr   r3, [pc, #40]
+ ...
+
+$ ${PREFIX}nm build/firmware.elf | grep -E 'Reset_Handler|_estack'
+20002000 R _estack
+08000180 T Reset_Handler</code></pre>
+
+<h3>5.3 Pistas</h3>
+<details class="hint">
+  <summary>Pista 1 — descodificar a primeira palavra (TODO A)</summary>
+  <p>O dump mostra <code>00200020</code> em <code>0x08000000</code>. O <code>readelf -x</code> agrupa os bytes tal como estão guardados. Volta a lê-los como um valor de 32 bits little-endian: a ordem de bytes guardada <code>00 20 00 20</code> torna-se o número <code>0x20002000</code>. Esse é o topo da SRAM de 8&nbsp;KB (<code>0x20000000 + 0x2000</code>) — exatamente o <code>_estack</code> que o linker calculou.</p>
+</details>
+<details class="hint">
+  <summary>Pista 2 — descodificar o vetor de reset (TODO B)</summary>
+  <p>A segunda palavra é <code>81010008</code>. Em little-endian → <code>0x08000181</code>. Compara com o <code>nm</code>: <code>Reset_Handler</code> está em <code>0x08000180</code>. Diferem apenas no bit&nbsp;0: <code>0x08000181</code> vs <code>0x08000180</code>. A <em>função</em> está no endereço par; o vetor guarda o valor ímpar. Porquê? Ver a Pista&nbsp;3.</p>
+</details>
+<details class="hint">
+  <summary>Pista 3 — o endereço ímpar (TODO C)</summary>
+  <p>O Cortex-M3 só executa instruções <strong>Thumb</strong>. Quando o núcleo carrega o <code>PC</code> a partir de um vetor (ou salta para um ponteiro de função), interpreta o <strong>bit&nbsp;0 como o bit <code>T</code> (estado Thumb) desejado</strong>, não como parte do endereço — as instruções estão sempre alinhadas a pelo menos 2 bytes, por isso o bit&nbsp;0 está livre para carregar esta flag. Um valor com bit&nbsp;0 = 1 significa "continuar em estado Thumb". A toolchain define portanto o bit&nbsp;0 em cada vetor de código. O hardware mascara-o de novo antes de fazer o fetch, por isso a execução começa de facto no endereço par <code>0x08000180</code>. Um vetor com bit&nbsp;0 = 0 pediria o estado ARM e faria fault imediatamente num Cortex-M3.</p>
+</details>
+
+<h3>5.4 Limpeza</h3>
+<p>Remove os artefactos de build quando terminares — este módulo não disponibiliza qualquer output compilado:</p>
+<pre><code>make -f ../common/Makefile PREFIX=$PREFIX SRC=../solutions/04-gpio-output.c clean</code></pre>
+
+<div class="box ok">
+  <span class="box-title">O que acabaste de provar</span>
+  A palavra 0 da Flash = <code>0x20002000</code> = <code>_estack</code> (MSP inicial), e a palavra 1 = <code>0x08000181</code> = endereço de <code>Reset_Handler</code> com o bit Thumb ativo. As duas coisas que o silício faz no reset estão ali mesmo nos primeiros oito bytes da imagem — sem magia, apenas uma tabela.
+</div>
+
+<!-- ============================== QUESTIONS ============================== -->
+<span class="section-tag">Perguntas de Verificação</span>
+<h2>6. Verifica a tua compreensão</h2>
+
+<details class="answer">
+  <summary>P1. O que faz exatamente o hardware do Cortex-M3 no reset — e o que <em>não</em> faz?</summary>
+  <p>Exatamente duas coisas: (1) carrega o <code>MSP</code> inicial a partir da palavra de 32 bits em <code>0x08000000</code> (entrada de vetor 0), e (2) carrega o <code>PC</code> a partir da palavra em <code>0x08000004</code> (entrada de vetor 1, o vetor de reset) e começa a executar aí. <strong>Não</strong> copia o <code>.data</code>, não zera o <code>.bss</code>, não configura relógios, nem chama o <code>main()</code> — tudo isso é software, feito pelo <code>Reset_Handler</code>.</p>
+</details>
+
+<details class="answer">
+  <summary>P2. <code>MSP</code> vs <code>PSP</code>: o que são e qual está ativo quando?</summary>
+  <p>Ambos são cópias físicas do stack pointer <code>R13</code> (é "banked"). <strong>O modo Handler usa sempre o <code>MSP</code></strong>. <strong>O modo Thread usa o <code>MSP</code> por omissão</strong> mas pode ser comutado para <code>PSP</code> através do bit <code>SPSEL</code> do registo <code>CONTROL</code> — um RTOS faz isto para dar às tarefas as suas próprias pilhas enquanto as ISRs mantêm a pilha principal. No reset o hardware carrega o <code>MSP</code>, e este curso mantém-se no <code>MSP</code> em modo Thread privilegiado de princípio ao fim.</p>
+</details>
+
+<details class="answer">
+  <summary>P3. Porque é que o <code>Reset_Handler</code> tem de zerar a secção <code>.bss</code>?</summary>
+  <p>A norma do C garante que os globais sem inicializador (ou inicializados a zero) leem <code>0</code> no arranque do programa. Essas variáveis são agrupadas em <code>.bss</code>, que deliberadamente não ocupa <em>nenhum</em> espaço na imagem da Flash (guardar kilobytes de zeros desperdiçaria Flash). Ao ligar a energia, a RAM correspondente contém lixo indefinido, por isso o ciclo de startup tem de escrever zeros ao longo de <code>_sbss</code>…<code>_ebss</code> para honrar a garantia antes de o <code>main()</code> correr.</p>
+</details>
+
+<details class="answer">
+  <summary>P4. Onde vivem os <em>valores iniciais</em> dos globais inicializados ao desligar, e porque têm de ser copiados?</summary>
+  <p>Vivem na <strong>Flash</strong>, no endereço de load (LMA) da secção <code>.data</code>, apontado por <code>_sidata</code>. Têm de estar na Flash porque a RAM é volátil e perde o seu conteúdo ao desligar. Mas as próprias variáveis têm de ser <strong>escrevíveis</strong>, por isso em tempo de execução vivem na RAM no endereço de run (VMA, <code>_sdata</code>…<code>_edata</code>). O passo 1 do <code>Reset_Handler</code> copia a imagem da Flash para a RAM para que, por exemplo, <code>int x = 5;</code> leia de facto <code>5</code> quando o <code>main()</code> começa.</p>
+</details>
+
+<details class="answer">
+  <summary>P5. Estás dentro de <code>SysTick_Handler</code>. O que lê o <code>IPSR</code>, e o que leria em <code>main()</code>?</summary>
+  <p>Dentro de <code>SysTick_Handler</code> o <code>IPSR</code> contém o número da exceção atual, que para o SysTick é <strong>15</strong> (o seu índice na tabela de vetores). Para uma IRQ de periférico <em>n</em> leria <em>16 + n</em>. Em <code>main()</code> — isto é, modo Thread, sem exceção ativa — o <code>IPSR</code> lê <strong>0</strong>. Ler o <code>IPSR</code> é a forma arquitetural de um handler partilhado descobrir qual exceção está a servir.</p>
+</details>
+
+<details class="answer">
+  <summary>P6. O vetor de reset na Flash lê <code>0x08000181</code>, mas o <code>Reset_Handler</code> está em <code>0x08000180</code>. Porquê o endereço ímpar?</summary>
+  <p>O bit 0 de um vetor de código (ou de qualquer ponteiro de função carregado no <code>PC</code>) é o <strong>bit de estado Thumb (<code>T</code>)</strong>, não parte do endereço — as instruções estão alinhadas a ≥2 bytes, por isso o bit 0 está sempre livre. O Cortex-M3 só executa código Thumb, por isso a toolchain define o bit 0 = 1 em cada vetor de código para pedir o estado Thumb. O hardware mascara-o antes de fazer o fetch, por isso a execução começa no endereço par <code>0x08000180</code>. Um vetor com bit 0 = 0 pediria o estado ARM e faria fault imediatamente.</p>
+</details>
+
+<div class="modfooter">
+  <a href="../01-arm-architecture/01-arm-architecture-pt.html">← 01 · Arquitetura ARM</a>
+  <a href="../03-memory-mapped-registers/03-memory-mapped-registers-pt.html">03 · Registos Mapeados em Memória →</a>
+</div>
+
+</div>
+</body>
+</html>

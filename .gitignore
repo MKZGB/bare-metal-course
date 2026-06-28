@@ -1,0 +1,17 @@
+# Build output (the shared Makefile writes here, inside each module folder)
+build/
+
+# Compiled / linked artefacts
+*.elf
+*.bin
+*.hex
+*.o
+*.map
+
+# Local Claude Code session settings (machine-specific, not for sharing)
+.claude/
+
+# Editor / OS cruft
+*.swp
+*~
+.DS_Store

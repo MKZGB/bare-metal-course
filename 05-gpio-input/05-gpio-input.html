@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · GPIO Input — Bare-Metal STM32</title>
+<link rel="stylesheet" href="../common/style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <a href="../README.md">Home</a>
+  <a href="../glossary.html">Glossary</a>
+  <a href="../04-gpio-output/04-gpio-output.html">‹ Prev</a>
+  <a href="../06-uart-transmit/06-uart-transmit.html">Next ›</a>
+  <a href="05-gpio-input-pt.html">🌐 Português</a>
+  <span class="spacer"></span>
+  <span class="badge">STM32F100RBT6 · RM0041</span>
+</nav>
+
+<div class="wrap">
+
+<h1><span class="modnum">Module 05</span> GPIO Input — Reading the Button</h1>
+<p class="subtitle">Configure a pin as a floating input with <code>CRL</code>, read the user button (B1 / PA0) through <code>IDR</code>, and mirror its state onto the green LED (LD3 / PC9).</p>
+
+<div class="box note">
+  <span class="box-title">Dependencies</span>
+  Complete <a href="../04-gpio-output/04-gpio-output.html">Module 04 (GPIO Output)</a> first — this module reuses the LED-output configuration from there (enable the port-C clock, set <code>PC9</code> as a push-pull output, drive it with <code>BSRR</code>) and adds an <em>input</em> pin on top.
+</div>
+
+<!-- ============================== THEORY ============================== -->
+<span class="section-tag">Theory</span>
+<h2>1. Output drives a pin, input senses one</h2>
+
+<p>In Module 04 the CPU <em>drove</em> a pin high or low. Reading an input is the mirror image: the pin is a sensor, and the CPU samples the voltage the outside world places on it. On the STM32VLDISCOVERY the user button is:</p>
+
+<ul>
+  <li><strong>B1 (user button)</strong> → <code>PA0</code> (port A, pin 0)</li>
+</ul>
+
+<div class="box warn">
+  <span class="box-title">B1 is ACTIVE HIGH on this board</span>
+  Many dev-board buttons read <code>0</code> when pressed (active low). <strong>B1 on the STM32VLDISCOVERY is the opposite.</strong> The board has an external <em>pull-down</em> resistor that holds <code>PA0</code> at 0&nbsp;V while the button is open, and pressing the button connects <code>PA0</code> to 3.3&nbsp;V. So <code>IDR</code> bit&nbsp;0 reads <strong>1 when pressed</strong> and <strong>0 when released</strong>. (The separate RESET button is not a GPIO and is not read here.)
+</div>
+
+<h3>1.1 Clocks again — now two ports</h3>
+<p>The button is on port A and the LED is on port C, so we must enable <em>both</em> clocks in <code>RCC_APB2ENR</code> before touching either port (RM0041 §7.3.7):</p>
+
+<table>
+  <tr><th>Register</th><th>Address</th><th>Bit</th><th>Meaning</th></tr>
+  <tr><td><code>RCC_APB2ENR</code></td><td><code>0x40021018</code></td><td>bit 2 — <code>IOPAEN</code></td><td>Enable clock for GPIO port A (button)</td></tr>
+  <tr><td><code>RCC_APB2ENR</code></td><td><code>0x40021018</code></td><td>bit 4 — <code>IOPCEN</code></td><td>Enable clock for GPIO port C (LED)</td></tr>
+</table>
+
+<h3>1.2 Configuring an input pin in CRL</h3>
+<p>The 4-bit-per-pin scheme is the same as outputs, but the <strong>CNF</strong> bits mean different things in input mode. To select <em>input</em>, set <code>MODE = 00</code>; the <code>CNF</code> field then chooses what kind of input:</p>
+
+<table>
+  <tr><th>MODE[1:0]</th><th>Meaning</th></tr>
+  <tr><td><code>00</code></td><td>Input mode (reset state)</td></tr>
+  <tr><td><code>01</code>/<code>10</code>/<code>11</code></td><td>Output (covered in Module 04)</td></tr>
+</table>
+<table>
+  <tr><th>CNF[1:0] (input mode)</th><th>Meaning</th></tr>
+  <tr><td><code>00</code></td><td>Analog input (pin routed to ADC; digital input buffer off)</td></tr>
+  <tr><td><code>01</code></td><td><strong>Floating input</strong> (reset default for most pins)</td></tr>
+  <tr><td><code>10</code></td><td>Input with pull-up / pull-down — direction chosen by the <code>ODR</code> bit (1 = pull-up, 0 = pull-down)</td></tr>
+  <tr><td><code>11</code></td><td>Reserved</td></tr>
+</table>
+
+<p>PA0 is in <code>CRL</code> (it handles pins 0–7). Its 4-bit field starts at bit <code>0 × 4 = 0</code>. We choose <strong>floating</strong> input because the board already has an external pull-down — enabling an internal pull would fight it. The nibble is:</p>
+
+<div class="diagram">CRL for PA0  (floating input)
+
+  field value = (CNF &lt;&lt; 2) | MODE = (01 &lt;&lt; 2) | 00 = 0b0100 = 0x4
+
+   bit:  ...15 14 13 12 | 11 10  9  8 | 7  6  5  4 | 3  2  1  0
+   pin:  ...  pin 3     |   pin 2     |   pin 1    |   pin 0
+   PA0 nibble at bits[3:0] -----------------------------^^^^</div>
+
+<div class="box note">
+  <span class="box-title">Why floating, not internal pull-down?</span>
+  We could pick <code>CNF = 10</code> (internal pull-up/down) and set the <code>ODR</code> bit to choose the pull-down direction. But B1 already has an <em>external</em> pull-down on the board, so floating input is the right match: the external resistor defines the idle level, and adding a second internal pull is redundant (and a pull-up would actively fight the board). Floating is also the pin's reset state, so on this board you could read PA0 without even configuring it — but we set it explicitly so the intent is clear.
+</div>
+
+<h3>1.3 IDR vs ODR — read one, write the other</h3>
+<p>Each GPIO port has two data registers, and confusing them is a classic beginner bug:</p>
+<table>
+  <tr><th>Register</th><th>Offset</th><th>Direction</th><th>Meaning</th></tr>
+  <tr><td><code>IDR</code> (Input Data Register)</td><td><code>0x08</code></td><td>read-only</td><td>The <em>live level on every pin</em>. Bit <code>n</code> = voltage sensed on pin <code>n</code>. You <strong>read</strong> this to sample inputs.</td></tr>
+  <tr><td><code>ODR</code> (Output Data Register)</td><td><code>0x0C</code></td><td>read/write</td><td>The level <em>you are driving</em> on output pins. Writing it sets outputs (use <code>BSRR</code> for atomic writes, per Module 04).</td></tr>
+</table>
+<p>So an input pin is sampled by reading <code>IDR</code>; an output pin is driven by writing <code>BSRR</code>/<code>ODR</code>. To test whether the button is pressed we read bit&nbsp;0 of <code>GPIOA_IDR</code>:</p>
+
+<div class="diagram">pressed = (GPIOA_IDR &gt;&gt; 0) &amp; 1   // 1 = pressed (active high), 0 = released</div>
+
+<table>
+  <tr><th>Register</th><th>Address</th><th>Offset</th></tr>
+  <tr><td><code>GPIOA base</code></td><td><code>0x40010800</code></td><td>—</td></tr>
+  <tr><td><code>GPIOA_CRL</code></td><td><code>0x40010800</code></td><td>0x00</td></tr>
+  <tr><td><code>GPIOA_IDR</code></td><td><code>0x40010808</code></td><td>0x08</td></tr>
+  <tr><td><code>GPIOC_CRH</code></td><td><code>0x40011004</code></td><td>0x04</td></tr>
+  <tr><td><code>GPIOC_BSRR</code></td><td><code>0x40011010</code></td><td>0x10</td></tr>
+</table>
+
+<h3>1.4 A word on switch debouncing</h3>
+<p>A mechanical switch does not make a single clean transition. When the contacts touch (or part), they physically <em>bounce</em> for a few milliseconds, producing a rapid burst of fake <code>0→1→0→1…</code> readings before settling. A naive "count every press" loop would register one push as several.</p>
+<p>The fix is <strong>debouncing</strong>: read the pin, wait a short, settle time (typically 5–20&nbsp;ms, via a delay or a timer), read again, and only accept the new state if it is stable across both samples. For this module we simply <em>mirror</em> the button onto the LED every loop, so bounce is harmless — but it is essential the moment you count edges or detect a single click. We will have proper timers in <a href="../08-systick-timer/08-systick-timer.html">Module 08</a>.</p>
+
+<div class="box warn">
+  <span class="box-title">What QEMU shows (be honest with yourself)</span>
+  The <code>stm32vldiscovery</code> machine in QEMU <strong>does not emulate GPIO at all</strong>. Reads of <code>IDR</code> always return <code>0</code>, so the button <strong>never appears pressed</strong>, and writes to <code>BSRR</code> are dropped, so the <strong>LED never turns on</strong> — no matter what you do at the keyboard. That is expected: there is no virtual button to press. You verify this module by <em>reasoning about the bit math</em> and by confirming the program builds and runs without faulting. The code is correct for real STM32VLDISCOVERY hardware, where pressing B1 lights LD3. Visible verification in QEMU begins with UART in <a href="../06-uart-transmit/06-uart-transmit.html">Module 06</a>.
+</div>
+
+<!-- ============================== EXERCISE ============================== -->
+<span class="section-tag">Guided Exercise</span>
+<h2>2. Mirror B1 (PA0) onto LD3 (PC9)</h2>
+
+<p><strong>Goal:</strong> write <code>main()</code> so the green LED is lit exactly while the button is held. You will:</p>
+<ol>
+  <li>Enable the GPIO port A <em>and</em> port C clocks (<code>RCC_APB2ENR</code> bits 2 and 4).</li>
+  <li>Configure <code>PA0</code> as a floating input in <code>CRL</code> (nibble <code>0x4</code>).</li>
+  <li>Configure <code>PC9</code> as a 2 MHz push-pull output in <code>CRH</code> (nibble <code>0x2</code>, from Module 04).</li>
+  <li>In an infinite loop, read <code>IDR</code> bit 0 and drive <code>PC9</code> high (pressed) or low (released) via <code>BSRR</code>.</li>
+</ol>
+
+<h3>2.1 Skeleton — create <code>05-gpio-input/main.c</code></h3>
+<p>Fill in every <code>TODO</code>. Do not look at the reference solution unless you are truly stuck.</p>
+
+<pre><code>#include &lt;stdint.h&gt;
+
+/* Register definitions (volatile = never cache in a CPU register) */
+#define RCC_APB2ENR  (*(volatile uint32_t *)0x40021018U)
+#define GPIOA_CRL    (*(volatile uint32_t *)0x40010800U)  /* PA0..PA7 config  */
+#define GPIOA_IDR    (*(volatile uint32_t *)0x40010808U)  /* PA input data    */
+#define GPIOC_CRH    (*(volatile uint32_t *)0x40011004U)  /* PC8..PC15 config */
+#define GPIOC_BSRR   (*(volatile uint32_t *)0x40011010U)  /* PC atomic set/rst*/
+
+#define RCC_IOPAEN   (1U &lt;&lt; 2)   /* GPIO port A clock enable (button) */
+#define RCC_IOPCEN   (1U &lt;&lt; 4)   /* GPIO port C clock enable (LED)    */
+
+#define BTN_PIN      0U          /* B1 user button = PA0 (active high) */
+#define LED_PIN      9U          /* LD3 green LED  = PC9               */
+
+int main(void)
+{
+    /* TODO 1: enable BOTH port A and port C clocks in RCC_APB2ENR
+     *         (OR in RCC_IOPAEN | RCC_IOPCEN, read-modify-write) */
+
+    /* TODO 2: configure PA0 as a FLOATING INPUT.
+     *         - the pin-0 field in CRL is at bit (0*4) = 0
+     *         - clear that 4-bit field, then OR in 0x4 (MODE=00, CNF=01)
+     *         - use a read-modify-write so other pins are untouched */
+
+    /* TODO 3: configure PC9 as output push-pull 2 MHz (same as Module 04).
+     *         - the pin-9 field in CRH is at bit ((9-8)*4) = 4
+     *         - clear it, then OR in 0x2 (MODE=10, CNF=00) */
+
+    for (;;)
+    {
+        /* TODO 4: read IDR bit BTN_PIN into a variable (1 = pressed). */
+
+        /* TODO 5: if pressed, set PC9 high via BSRR (bit LED_PIN);
+         *         else set PC9 low via BSRR (bit LED_PIN + 16). */
+    }
+
+    return 0;
+}
+</code></pre>
+
+<h3>2.2 Build &amp; run</h3>
+<p>From inside the <code>05-gpio-input/</code> folder:</p>
+<pre><code>make -f ../common/Makefile SRC=main.c run</code></pre>
+<p>QEMU starts and runs your loop. Because GPIO is not emulated, <code>IDR</code> reads 0 forever, so the LED stays off — there is nothing to see (expected). Quit with <kbd>Ctrl-A</kbd> then <kbd>X</kbd>. Success criterion for this module: it <strong>compiles with no warnings and runs without hitting the fault handler</strong>.</p>
+
+<div class="box warn">
+  <span class="box-title">Do not block on a flag QEMU will never set</span>
+  Notice the loop reads <code>IDR</code> once per pass and always makes progress — it never spins <em>waiting</em> for a bit. If you wrote <code>while (!(GPIOA_IDR &amp; 1U)) { }</code> ("wait until the button is pressed"), the program would <strong>hang forever in QEMU</strong>, because <code>IDR</code> is frozen at 0. Whenever a flag depends on an un-emulated peripheral, poll-and-continue (or use a bounded counter) instead of an unbounded wait.
+</div>
+
+<h3>2.3 Hints</h3>
+<details class="hint">
+  <summary>Hint 1 — enabling two clocks at once</summary>
+  <p>OR both enable bits in a single read-modify-write so you do not clobber other bits:
+  <code>RCC_APB2ENR |= (RCC_IOPAEN | RCC_IOPCEN);</code></p>
+</details>
+<details class="hint">
+  <summary>Hint 2 — the CRL field for PA0 (input floating)</summary>
+  <p>Shift is <code>BTN_PIN * 4 = 0</code>. Mask to clear: <code>(0xFU &lt;&lt; 0)</code>. Value: <code>(0x4U &lt;&lt; 0)</code> (MODE=00 input, CNF=01 floating). Combine:
+  <code>GPIOA_CRL = (GPIOA_CRL &amp; ~(0xFU &lt;&lt; 0)) | (0x4U &lt;&lt; 0);</code></p>
+</details>
+<details class="hint">
+  <summary>Hint 3 — reading the button from IDR</summary>
+  <p><code>IDR</code> bit <code>n</code> is the live level on pin <code>n</code>. Isolate bit 0:
+  <code>uint32_t pressed = (GPIOA_IDR &gt;&gt; BTN_PIN) &amp; 1U;</code> Because B1 is active high, <code>pressed == 1U</code> means the button is down.</p>
+</details>
+<details class="hint">
+  <summary>Hint 4 — driving the LED from the button state</summary>
+  <p>Use <code>BSRR</code> (atomic, no read-modify-write):<br>
+  On: <code>GPIOC_BSRR = (1U &lt;&lt; LED_PIN);</code> &nbsp; Off: <code>GPIOC_BSRR = (1U &lt;&lt; (LED_PIN + 16U));</code><br>
+  Pick one based on the <code>pressed</code> value with an <code>if/else</code>.</p>
+</details>
+
+<div class="box ok">
+  <span class="box-title">Reference solution</span>
+  Full, commented solution: <code>solutions/05-gpio-input.c</code>. Try every hint first.
+</div>
+
+<!-- ============================== QUESTIONS ============================== -->
+<span class="section-tag">Verification Questions</span>
+<h2>3. Check your understanding</h2>
+
+<details class="answer">
+  <summary>Q1. What is the difference between <code>IDR</code> and <code>ODR</code>?</summary>
+  <p><code>IDR</code> (Input Data Register, offset 0x08, read-only) reports the live voltage level sensed on each pin — you <em>read</em> it to sample inputs. <code>ODR</code> (Output Data Register, offset 0x0C) holds the level you are <em>driving</em> on output pins — you write it (or, better, use the atomic <code>BSRR</code>) to set outputs. Reading inputs from <code>ODR</code>, or driving outputs by writing <code>IDR</code>, does not work.</p>
+</details>
+<details class="answer">
+  <summary>Q2. Why did we configure PA0 as <em>floating</em> input rather than internal pull-up or pull-down?</summary>
+  <p>Because B1 on the STM32VLDISCOVERY already has an <em>external</em> pull-down resistor that defines the idle level (PA0 = 0 when released). A floating input (CNF=01) leaves that external resistor in charge. An internal pull-down would be redundant; an internal pull-up (CNF=10 with ODR bit set) would actively fight the board's pull-down and give an indeterminate level. Floating is also the pin's reset default.</p>
+</details>
+<details class="answer">
+  <summary>Q3. The button reads <code>1</code> when pressed here. When would a button read <code>0</code> when pressed?</summary>
+  <p>That is the more common <em>active-low</em> wiring: a pull-up resistor holds the pin high while the button is open, and pressing it connects the pin to ground, pulling it to 0. B1 on this board is the less common <em>active-high</em> arrangement (external pull-down, press connects to 3.3 V), so it reads 1 when pressed. Always check the schematic — the polarity decides whether you test for a 1 or a 0.</p>
+</details>
+<details class="answer">
+  <summary>Q4. What is switch bounce, and why does this program not need to handle it?</summary>
+  <p>When a mechanical switch's contacts open or close they vibrate for a few milliseconds, producing a rapid burst of spurious transitions before settling. This program simply mirrors the current button level onto the LED every loop iteration, so a few extra transitions during the bounce window are invisible to the user. Debouncing (sample, wait ~5–20 ms, re-sample, accept only if stable) becomes necessary as soon as you count presses or detect a single click.</p>
+</details>
+<details class="answer">
+  <summary>Q5. You run it in QEMU and the LED never lights, even pressing keys. Is your code wrong?</summary>
+  <p>No. QEMU's <code>stm32vldiscovery</code> does not emulate GPIO, so <code>IDR</code> always reads 0 (the button never appears pressed) and <code>BSRR</code> writes are dropped (no LED). There is no virtual button to press. The code is correct for real hardware, where holding B1 lights LD3. Also note: you must <em>not</em> write <code>while(!(IDR&amp;1)){}</code> — that would hang forever in QEMU since the bit never sets.</p>
+</details>
+
+<div class="modfooter">
+  <a href="../04-gpio-output/04-gpio-output.html">← 04 · GPIO Output</a>
+  <a href="../06-uart-transmit/06-uart-transmit.html">06 · UART Transmit →</a>
+</div>
+
+</div>
+</body>
+</html>

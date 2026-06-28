@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>09 · General-Purpose Timers — Bare-Metal STM32</title>
+<link rel="stylesheet" href="../common/style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <a href="../README.md">Home</a>
+  <a href="../glossary.html">Glossary</a>
+  <a href="../08-systick-timer/08-systick-timer.html">‹ Prev</a>
+  <a href="../10-interrupts-nvic/10-interrupts-nvic.html">Next ›</a>
+  <a href="09-general-purpose-timers-pt.html">🌐 Português</a>
+  <span class="spacer"></span>
+  <span class="badge">STM32F100RBT6 · RM0041</span>
+</nav>
+
+<div class="wrap">
+
+<h1><span class="modnum">Module 09</span> General-Purpose Timers — Time Base, PWM, Input Capture</h1>
+<p class="subtitle">Configure <code>TIM3</code> as a 1 Hz time base from the 8 MHz clock using <code>PSC</code>/<code>ARR</code>/<code>CEN</code>, watch the <code>UIF</code> update flag, and meet Output Compare (PWM) and Input Capture — all while staying honest about what QEMU does <em>not</em> emulate.</p>
+
+<div class="box note">
+  <span class="box-title">Dependencies</span>
+  This module builds on <a href="../06-uart-transmit/06-uart-transmit.html">Module 06 (UART + printf)</a> for visible output and reuses the clock-gating idea from <a href="../04-gpio-output/04-gpio-output.html">Module 04</a>. <a href="../08-systick-timer/08-systick-timer.html">Module 08 (SysTick)</a> gave you a <em>core</em> timer; here you meet a real <em>peripheral</em> timer with prescaler, auto-reload and capture/compare channels.
+</div>
+
+<!-- ============================== THEORY ============================== -->
+<span class="section-tag">Theory</span>
+<h2>1. The time-base unit</h2>
+
+<p>The STM32F100 has three general-purpose timers — <code>TIM2</code>, <code>TIM3</code>, <code>TIM4</code> — each a 16-bit up/down counter with four capture/compare channels. They sit on the <strong>APB1</strong> bus. This module uses <strong>TIM3</strong> (base <code>0x40000400</code>). At the heart of every timer is the <em>time-base unit</em>: three registers that turn the bus clock into a programmable tick.</p>
+
+<table>
+  <tr><th>Register</th><th>Address</th><th>Role</th></tr>
+  <tr><td><code>TIM3_PSC</code></td><td><code>0x40000428</code></td><td><strong>Prescaler</strong>: divides the input clock by <code>PSC + 1</code>.</td></tr>
+  <tr><td><code>TIM3_ARR</code></td><td><code>0x4000042C</code></td><td><strong>Auto-reload</strong>: the counter wraps after reaching this value.</td></tr>
+  <tr><td><code>TIM3_CNT</code></td><td><code>0x40000424</code></td><td><strong>Counter</strong>: the live count (0 → ARR → 0 …).</td></tr>
+</table>
+
+<p>The counting clock is:</p>
+<div class="diagram">f_CK_CNT = f_CK_PSC / (PSC + 1)
+
+  8 MHz input, PSC = 7999:
+      8 000 000 / (7999 + 1) = 1 000 Hz   (one tick per millisecond)
+
+CNT then counts 0,1,2,...,ARR and wraps. With ARR = 999 it wraps
+every (999 + 1) = 1000 ticks = once per second:
+
+      update rate = f_CK_CNT / (ARR + 1) = 1000 / 1000 = 1 Hz</div>
+
+<p>Each time the counter wraps, an <strong>update event</strong> occurs and the hardware sets the <strong>UIF</strong> (Update Interrupt Flag) in <code>TIM3_SR</code> bit 0. Polling — or interrupting on — this flag is how you build a periodic tick. <em>Software must clear UIF</em> (write 0 to it) before the next period, or you can never tell two periods apart.</p>
+
+<h3>1.1 The control bits: CEN and UG</h3>
+<table>
+  <tr><th>Bit</th><th>Register</th><th>Meaning</th></tr>
+  <tr><td><code>CEN</code> (bit 0)</td><td><code>TIM3_CR1</code> (0x00)</td><td><strong>Counter Enable</strong> — the master switch. While <code>CEN = 0</code> the counter is frozen.</td></tr>
+  <tr><td><code>UG</code> (bit 0)</td><td><code>TIM3_EGR</code> (0x14)</td><td><strong>Update Generation</strong> — writing 1 forces an update event <em>right now</em>.</td></tr>
+  <tr><td><code>UIF</code> (bit 0)</td><td><code>TIM3_SR</code> (0x10)</td><td><strong>Update flag</strong> — set by hardware on every wrap; cleared by software.</td></tr>
+</table>
+
+<div class="box note">
+  <span class="box-title">Why you must pulse UG after writing PSC</span>
+  The prescaler is <em>buffered</em>: a value written to <code>PSC</code> does not take effect until the next update event. If you write <code>PSC</code> and then start the counter, the first period still uses the old prescaler. Writing <code>UG = 1</code> forces an immediate update that reloads the prescaler with the new <code>PSC</code> and resets <code>CNT</code> to 0. (UG also sets <code>UIF</code> as a side effect, so clear <code>UIF</code> afterwards.)
+</div>
+
+<div class="box danger">
+  <span class="box-title">⚠ CRITICAL: QEMU does NOT emulate TIM2/3/4</span>
+  On <code>qemu-system-arm -M stm32vldiscovery</code>, the general-purpose timers are <strong>not emulated at all</strong>. The counter <code>CNT</code> stays frozen at <code>0</code> and the update flag <code>UIF</code> <strong>never sets</strong>. This means a naive <code>while ((TIM3_SR &amp; UIF) == 0U) {}</code> would <strong>hang forever</strong> in QEMU. Your code must <strong>never</strong> do an unbounded wait on a timer flag. Use the <em>bounded-wait</em> pattern (section 4): spin on <code>UIF</code> with a guard counter, and if it never sets, print that this is the expected QEMU limitation. On <strong>real STM32F100 hardware</strong> the timer runs and <code>UIF</code> sets at 1 Hz.
+</div>
+
+<h2>2. Output Compare and PWM</h2>
+
+<p>Beyond a plain time base, each timer channel can compare the counter against a target value held in a <strong>capture/compare register</strong> <code>CCR<sub>x</sub></code> and drive an output pin when they match. This is <strong>Output Compare (OC)</strong>, and its most common use is <strong>PWM</strong> (Pulse-Width Modulation).</p>
+
+<table>
+  <tr><th>Register</th><th>Offset</th><th>Role in PWM</th></tr>
+  <tr><td><code>CCMR1</code></td><td><code>0x18</code></td><td>Per-channel mode. The <code>OC1M[2:0]</code> bits select <em>PWM mode 1</em> (<code>110</code>): output is active while <code>CNT &lt; CCR1</code>.</td></tr>
+  <tr><td><code>CCER</code></td><td><code>0x20</code></td><td><code>CC1E</code> (bit 0) enables the channel output on the pin; <code>CC1P</code> (bit 1) sets polarity.</td></tr>
+  <tr><td><code>CCR1</code></td><td><code>0x34</code></td><td>The compare value — sets the <strong>duty cycle</strong>.</td></tr>
+</table>
+
+<div class="diagram">PWM frequency  = f_CK_CNT / (ARR + 1)        (set by PSC and ARR)
+PWM duty cycle = CCR1 / (ARR + 1)            (set by CCR1)
+
+  ARR = 999, CCR1 = 250  -> 25% duty
+  ARR = 999, CCR1 = 500  -> 50% duty
+
+   CNT:  0 .......... 250 .......... 999 | 0 ....
+   PA6:  |__HIGH_____|____LOW__________|  |__HIGH...
+                 ^ CNT crossed CCR1, output drops</div>
+
+<p>For <code>TIM3</code> channel 1 the output pin is <strong>PA6</strong>, configured as <em>alternate-function push-pull</em> (CRL nibble <code>0xB</code>, just like the UART TX pin) so the timer — not the GPIO data register — drives it. Change <code>ARR</code> to set frequency, change <code>CCR1</code> to set brightness/duty. PWM is how you dim an LED or set a servo angle without a DAC.</p>
+
+<div class="box warn">
+  <span class="box-title">QEMU caveat for PWM</span>
+  Because TIM2/3/4 are not emulated and GPIO is not emulated either, you cannot observe a PWM waveform in QEMU. The register configuration below is correct for real hardware; in this course we keep OC/PWM <em>conceptual</em> and verify only the time-base logic.
+</div>
+
+<h2>3. Input Capture</h2>
+
+<p><strong>Input Capture (IC)</strong> is Output Compare run backwards. Instead of the counter driving a pin, an <em>external edge on a pin</em> causes the hardware to copy the current <code>CNT</code> into <code>CCR<sub>x</sub></code> — a timestamp of when the edge arrived. Configure it through the same <code>CCMR1</code> register, but with the <code>CC1S[1:0]</code> bits set to <em>input</em> mode (e.g. <code>01</code> = map IC1 to TI1).</p>
+
+<ul>
+  <li>Capture <code>CNT</code> on a <strong>rising</strong> edge, then on a <strong>falling</strong> edge → the difference is the <strong>pulse width</strong>.</li>
+  <li>Capture <code>CNT</code> on two successive rising edges → the difference is the <strong>period</strong> (so <code>1 / period</code> gives the input <strong>frequency</strong>).</li>
+  <li>The <code>CC1IF</code> flag (<code>SR</code> bit 1) signals "a capture happened"; reading <code>CCR1</code> clears it.</li>
+</ul>
+
+<table>
+  <tr><th>Direction</th><th>Drives</th><th>You set</th><th>You read</th></tr>
+  <tr><td><strong>Output Compare / PWM</strong></td><td>counter → pin</td><td><code>CCR1</code> (target / duty)</td><td>—</td></tr>
+  <tr><td><strong>Input Capture</strong></td><td>pin edge → register</td><td>edge &amp; channel mode</td><td><code>CCR1</code> (captured timestamp)</td></tr>
+</table>
+
+<!-- ============================== EXERCISE ============================== -->
+<span class="section-tag">Guided Exercise</span>
+<h2>4. Make TIM3 tick at 1 Hz (bounded wait)</h2>
+
+<p><strong>Goal:</strong> bring up <code>TIM3</code> as a 1 Hz time base, print what you configured over USART1, and watch for a few update events — <em>without ever hanging in QEMU</em>. You will:</p>
+<ol>
+  <li>Enable the <code>TIM3</code> clock (<code>RCC_APB1ENR</code> bit 1).</li>
+  <li>Write <code>PSC = 7999</code> and <code>ARR = 999</code> for a 1 Hz update.</li>
+  <li>Pulse <code>UG</code> to load the prescaler, clear <code>UIF</code>, then set <code>CEN</code>.</li>
+  <li>Use a <strong>bounded wait</strong> on <code>UIF</code> so the demo terminates in QEMU.</li>
+</ol>
+
+<h3>4.1 Skeleton — create <code>09-general-purpose-timers/main.c</code></h3>
+<p>Reuse your USART1 + <code>printf</code> code from Module 06 (omitted here for brevity). Fill in every <code>TODO</code>. Do not look at the reference solution until you are stuck.</p>
+
+<pre><code>#include &lt;stdint.h&gt;
+#include &lt;stdio.h&gt;
+
+/* (USART1 init + _write() retarget from Module 06 go here.) */
+
+/* ---- RCC ---- */
+#define RCC_APB1ENR  (*(volatile uint32_t *)0x4002101CU)
+#define RCC_TIM3EN   (1U &lt;&lt; 1)        /* TIM3 clock enable (APB1 bit1)   */
+
+/* ---- TIM3 (base 0x40000400) ---- */
+#define TIM3_CR1     (*(volatile uint32_t *)0x40000400U)  /* +0x00 */
+#define TIM3_SR      (*(volatile uint32_t *)0x40000410U)  /* +0x10 */
+#define TIM3_EGR     (*(volatile uint32_t *)0x40000414U)  /* +0x14 */
+#define TIM3_CNT     (*(volatile uint32_t *)0x40000424U)  /* +0x24 */
+#define TIM3_PSC     (*(volatile uint32_t *)0x40000428U)  /* +0x28 */
+#define TIM3_ARR     (*(volatile uint32_t *)0x4000042CU)  /* +0x2C */
+
+#define TIM_CR1_CEN  (1U &lt;&lt; 0)        /* counter enable        */
+#define TIM_EGR_UG   (1U &lt;&lt; 0)        /* force update          */
+#define TIM_SR_UIF   (1U &lt;&lt; 0)        /* update flag           */
+
+static void tim3_init(void)
+{
+    RCC_APB1ENR |= RCC_TIM3EN;       /* clock TIM3 first */
+
+    /* TODO 1: write PSC for a 1 kHz counting clock from 8 MHz.
+     *         8000000 / (PSC + 1) = 1000  ->  PSC = ?  */
+
+    /* TODO 2: write ARR so the counter wraps once per second.
+     *         1000 / (ARR + 1) = 1  ->  ARR = ?  */
+
+    /* TODO 3: pulse UG (TIM3_EGR) to load the prescaler now,
+     *         then clear UIF in TIM3_SR (UG sets it as a side effect). */
+
+    /* TODO 4: start the counter by setting CEN in TIM3_CR1. */
+}
+
+/* Returns 1 if UIF observed, 0 if it never set (the QEMU case). */
+static uint32_t tim3_wait_update_bounded(void)
+{
+    uint32_t guard = 2000000U;       /* guard so we never hang in QEMU */
+
+    /* TODO 5: spin while UIF is clear AND guard &gt; 0, decrementing guard.
+     *         If guard hit 0, return 0 (UIF never set).
+     *         Otherwise clear UIF and return 1. */
+
+    return 0U;   /* replace with real logic */
+}
+
+int main(void)
+{
+    uart_init();                                 /* from Module 06 */
+    (void)setvbuf(stdout, NULL, _IONBF, 0);
+
+    tim3_init();
+    printf("PSC=%u ARR=%u CEN set\n",
+           (unsigned int)TIM3_PSC, (unsigned int)TIM3_ARR);
+    printf("CNT read-back = %u (0 in QEMU)\n", (unsigned int)TIM3_CNT);
+
+    for (uint32_t i = 0U; i &lt; 3U; i++)
+    {
+        if (tim3_wait_update_bounded() != 0U)
+            printf("  event %u: UIF set (real hardware)\n", (unsigned int)(i+1U));
+        else
+            printf("  event %u: UIF never set - expected in QEMU\n", (unsigned int)(i+1U));
+    }
+
+    for (;;) { /* parked; not hanging */ }
+    return 0;
+}
+</code></pre>
+
+<h3>4.2 Build &amp; run</h3>
+<p>From inside the <code>09-general-purpose-timers/</code> folder:</p>
+<pre><code>make -f ../common/Makefile SRC=main.c run</code></pre>
+<p>Expected: it prints the configured <code>PSC</code>/<code>ARR</code>, shows <code>CNT = 0</code>, and reports for each event that <code>UIF</code> never set — then finishes. Success criterion: <strong>compiles with no warnings and the program prints and parks instead of hanging</strong>. Quit QEMU with <kbd>Ctrl-A</kbd> then <kbd>X</kbd>.</p>
+
+<h3>4.3 Hints</h3>
+<details class="hint">
+  <summary>Hint 1 — the PSC/ARR math</summary>
+  <p>Counting clock <code>= 8000000 / (PSC + 1)</code>. For 1 kHz you need <code>PSC + 1 = 8000</code> → <code>PSC = 7999</code>. Update rate <code>= 1000 / (ARR + 1)</code>. For 1 Hz you need <code>ARR + 1 = 1000</code> → <code>ARR = 999</code>. So <code>TIM3_PSC = 7999U;</code> and <code>TIM3_ARR = 999U;</code>.</p>
+</details>
+<details class="hint">
+  <summary>Hint 2 — loading the prescaler and starting</summary>
+  <p>Pulse update generation, then clear the flag it set, then enable the counter:
+  <code>TIM3_EGR = TIM_EGR_UG; TIM3_SR &amp;= ~TIM_SR_UIF; TIM3_CR1 |= TIM_CR1_CEN;</code></p>
+</details>
+<details class="hint">
+  <summary>Hint 3 — the bounded wait (do NOT hang)</summary>
+  <p>Never write <code>while ((TIM3_SR &amp; TIM_SR_UIF) == 0U) {}</code> — in QEMU UIF never sets and that loops forever. Instead:</p>
+  <pre><code>uint32_t guard = 2000000U;
+while (((TIM3_SR &amp; TIM_SR_UIF) == 0U) &amp;&amp; (guard &gt; 0U)) { guard--; }
+if (guard == 0U) { return 0U; }        /* UIF never set (QEMU) */
+TIM3_SR &amp;= ~TIM_SR_UIF;                 /* clear for next period */
+return 1U;</code></pre>
+  <p>On real hardware UIF sets within ~1 s and the loop exits early with <code>guard &gt; 0</code>.</p>
+</details>
+
+<div class="box ok">
+  <span class="box-title">Reference solution</span>
+  Full, commented solution: <code>solutions/09-general-purpose-timers.c</code>. Try every hint first.
+</div>
+
+<!-- ============================== QUESTIONS ============================== -->
+<span class="section-tag">Verification Questions</span>
+<h2>5. Check your understanding</h2>
+
+<details class="answer">
+  <summary>Q1. You want a 2 Hz update from the 8 MHz clock. Give one valid <code>PSC</code>/<code>ARR</code> pair.</summary>
+  <p>Keep the 1 kHz tick: <code>PSC = 7999</code> (8 000 000 / 8000 = 1 kHz). Then <code>update = 1000 / (ARR + 1) = 2</code> → <code>ARR + 1 = 500</code> → <code>ARR = 499</code>. Many pairs work; another is <code>PSC = 3999</code> (→ 2 kHz) with <code>ARR = 999</code>. The product <code>(PSC+1)·(ARR+1)</code> must equal <code>8 000 000 / 2 = 4 000 000</code>.</p>
+</details>
+<details class="answer">
+  <summary>Q2. What is the <code>UIF</code> flag and whose job is it to clear it?</summary>
+  <p><code>UIF</code> (Update Interrupt Flag, <code>TIM3_SR</code> bit 0) is set by <em>hardware</em> on every update event (counter wrap, or a forced UG). The <em>software</em> must clear it (write 0) before the next period; otherwise you cannot distinguish one period from the next, and an interrupt handler would re-fire endlessly.</p>
+</details>
+<details class="answer">
+  <summary>Q3. What is the difference between Output Compare (PWM) and Input Capture?</summary>
+  <p><strong>Output Compare / PWM</strong>: the counter drives a pin. You write a target into <code>CCR1</code> and the hardware toggles the output when <code>CNT</code> reaches it — used to <em>generate</em> a waveform (set duty via <code>CCR1</code>, frequency via <code>ARR</code>). <strong>Input Capture</strong>: an external edge on a pin drives a register. The hardware copies <code>CNT</code> into <code>CCR1</code> at the edge, timestamping it — used to <em>measure</em> an input's pulse width or frequency.</p>
+</details>
+<details class="answer">
+  <summary>Q4. Why can't the demo rely on QEMU to show the timer ticking?</summary>
+  <p>QEMU's <code>stm32vldiscovery</code> machine does not emulate TIM2/3/4: <code>CNT</code> stays 0 and <code>UIF</code> never sets. An unbounded <code>while (!(TIM3_SR &amp; UIF))</code> would hang forever. We therefore use a bounded wait with a guard counter that always terminates, and print that the missing flag is the expected QEMU limitation. The register configuration is still correct and the timer runs on real STM32F100 hardware.</p>
+</details>
+<details class="answer">
+  <summary>Q5. What do <code>CEN</code> and <code>UG</code> each do, and why pulse <code>UG</code> right after writing <code>PSC</code>?</summary>
+  <p><code>CEN</code> (<code>CR1</code> bit 0) is the master enable — the counter does not run until it is set. <code>UG</code> (<code>EGR</code> bit 0) forces an immediate update event. The prescaler is buffered, so a freshly written <code>PSC</code> only takes effect at the next update; pulsing <code>UG</code> makes that happen now (also reloading <code>CNT = 0</code>), so the very first period already uses your new prescaler. Remember <code>UG</code> sets <code>UIF</code>, so clear it before starting.</p>
+</details>
+
+<div class="modfooter">
+  <a href="../08-systick-timer/08-systick-timer.html">← 08 · SysTick Timer</a>
+  <a href="../10-interrupts-nvic/10-interrupts-nvic.html">10 · Interrupts &amp; NVIC →</a>
+</div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Glossário — Curso Bare-Metal STM32</title>
+<link rel="stylesheet" href="common/style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <a href="README-pt.md">Início</a>
+  <a href="01-arm-architecture/01-arm-architecture-pt.html">Módulo 01</a>
+  <a href="glossary.html">🌐 English</a>
+  <span class="spacer"></span>
+  <span class="badge">STM32F100RBT6 · RM0041</span>
+</nav>
+
+<div class="wrap">
+
+<h1><span class="modnum">Referência</span> Glossário</h1>
+<p class="subtitle">Termos-chave usados ao longo do curso, definidos uma só vez para garantir consistência. Os termos estão agrupados por tema; dentro de cada grupo, constroem-se uns sobre os outros.</p>
+
+<div class="box note">
+  <span class="box-title">Como usar esta página</span>
+  Lê-a por alto uma vez antes do Módulo 01 e regressa sempre que um termo de um módulo te for desconhecido. Os nomes dos registos ligam conceptualmente ao módulo que os utiliza.
+</div>
+
+<!-- ===================== ARCHITECTURE ===================== -->
+<span class="section-tag">Arquitetura e Núcleo</span>
+<h2>Conceitos ARM / Cortex-M</h2>
+
+<h4>RISC (Reduced Instruction Set Computer)</h4>
+<p>Uma filosofia de conceção de CPU que favorece muitas instruções simples, de comprimento fixo e quase de ciclo único, em vez de poucas instruções complexas. O ARM é uma arquitetura RISC. <em>(Módulo 01)</em></p>
+
+<h4>Arquitetura load-store</h4>
+<p>Uma característica RISC: as instruções aritméticas/lógicas operam <strong>apenas sobre registos</strong>; a memória só é acedida por instruções dedicadas de carregamento (<code>ldr</code>) e armazenamento (<code>str</code>). <em>(Módulo 01)</em></p>
+
+<h4>Cortex-M3</h4>
+<p>O núcleo de processador ARM dentro do STM32F100. Implementa a arquitetura ARMv7-M, executa o conjunto de instruções Thumb-2, é little-endian e tem um pipeline de 3 andares. <em>(Módulos 01–02)</em></p>
+
+<h4>Thumb / Thumb-2</h4>
+<p>Codificações de instruções compactas de 16/32 bits que melhoram a densidade de código em MCUs com flash limitada. Os núcleos Cortex-M executam Thumb-2 exclusivamente; o bit "T" no EPSR tem de permanecer a 1. <em>(Módulos 01–02)</em></p>
+
+<h4>Registos do núcleo (R0–R15)</h4>
+<p>R0–R12 são de uso geral. R13 = <strong>SP</strong> (apontador de pilha), R14 = <strong>LR</strong> (registo de ligação, contém o endereço de retorno), R15 = <strong>PC</strong> (contador de programa). <em>(Módulo 02)</em></p>
+
+<h4>MSP / PSP</h4>
+<p>Os dois apontadores de pilha alternáveis selecionados por R13: o apontador de pilha <strong>principal</strong> (Main Stack Pointer, usado no reset e nos handlers) e o apontador de pilha de <strong>processo</strong> (Process Stack Pointer, frequentemente usado por código de threads/tarefas sob um RTOS). Este curso usa apenas o MSP. <em>(Módulo 02)</em></p>
+
+<h4>xPSR (APSR / IPSR / EPSR)</h4>
+<p>O registo de estado do programa. O <strong>APSR</strong> contém as flags de condição (N, Z, C, V); o <strong>IPSR</strong> contém o número da exceção atualmente em execução (0 em modo thread); o <strong>EPSR</strong> contém o estado de execução, incluindo o bit Thumb. <em>(Módulo 02)</em></p>
+
+<h4>Modo thread / Modo handler</h4>
+<p>O modo thread executa código normal; o núcleo entra automaticamente no modo handler para executar um handler de exceção/interrupção. <em>(Módulos 02, 10)</em></p>
+
+<!-- ===================== STARTUP ===================== -->
+<span class="section-tag">Arranque e Memória</span>
+<h2>Do reset até <code>main()</code></h2>
+
+<h4>Tabela de vetores</h4>
+<p>Um array no início da Flash (<code>0x08000000</code>) cujas entradas são o apontador de pilha inicial (entrada 0) seguido dos endereços do reset handler e de cada handler de exceção/interrupção. O hardware indexa-a pelo número da exceção. Definida em <code>common/startup.c</code>. <em>(Módulos 02, 10)</em></p>
+
+<h4>Reset handler</h4>
+<p>O primeiro código que corre após o reset. Copia os dados inicializados da Flash para a RAM, zera a secção <code>.bss</code> e depois chama <code>main()</code>. Ver <code>Reset_Handler</code> em <code>common/startup.c</code>. <em>(Módulo 02)</em></p>
+
+<h4>.data / .bss</h4>
+<p><code>.data</code> = variáveis globais com valores iniciais não nulos (armazenadas na Flash, copiadas para a RAM no arranque). <code>.bss</code> = variáveis globais inicializadas a zero (sem armazenamento na Flash; o código de arranque zera a RAM). <em>(Módulo 02)</em></p>
+
+<h4>Script do linker (<code>linker.ld</code>)</h4>
+<p>Indica ao linker o mapa de memória do chip (Flash em <code>0x08000000</code>, SRAM em <code>0x20000000</code>) e que secções vão para onde, incluindo a separação entre endereço de <em>carregamento</em> e de <em>execução</em> para a <code>.data</code>. <em>(Módulos 02–03)</em></p>
+
+<h4>VMA / LMA</h4>
+<p>Endereço de memória virtual (Virtual Memory Address, onde uma secção é <em>acedida</em> em tempo de execução, p. ex. a <code>.data</code> na RAM) versus endereço de memória de carregamento (Load Memory Address, onde a sua imagem é <em>armazenada</em>, p. ex. na Flash). O código de arranque faz a ponte entre os dois. <em>(Módulo 02)</em></p>
+
+<!-- ===================== MMIO ===================== -->
+<span class="section-tag">Registos e MMIO</span>
+<h2>Comunicar com o hardware</h2>
+
+<h4>MMIO (Memory-Mapped I/O)</h4>
+<p>Os registos de controlo dos periféricos aparecem em endereços fixos no espaço de endereçamento do CPU; ler/escrever nesses endereços controla o hardware. Os periféricos do STM32 começam em <code>0x40000000</code>; os periféricos do núcleo (NVIC, SysTick) em <code>0xE000E000</code>. <em>(Módulo 03)</em></p>
+
+<h4><code>volatile</code></h4>
+<p>Um qualificador de C que diz ao compilador que uma variável/registo pode mudar fora do controlo do programa, pelo que cada acesso tem de acontecer realmente e não pode ser reordenado nem colocado em cache. Obrigatório para registos MMIO e para variáveis partilhadas com handlers de interrupção. <em>(Módulos 03, 10)</em></p>
+
+<h4>RCC (Reset and Clock Control)</h4>
+<p>O periférico que controla (gating) o relógio de cada um dos outros periféricos. Um periférico com o relógio desligado ignora todas as escritas nos registos — por isso, primeiro ligas o seu relógio num registo <code>…ENR</code> do RCC. Base <code>0x40021000</code>. <em>(Módulos 03–04)</em></p>
+
+<h4>Clock gating (gestão de relógio)</h4>
+<p>Ligar/desligar o relógio de um periférico para poupar energia. Esquecer-se de ligar um relógio é o clássico bug do "o meu driver não faz nada". <em>(Módulo 04)</em></p>
+
+<h4>Read-modify-write (ler-modificar-escrever)</h4>
+<p>Ler um registo, alterar alguns bits com operações de máscara/deslocamento e voltar a escrevê-lo — usado para definir um campo sem perturbar os restantes. Pode entrar em condição de corrida com interrupções, razão pela qual existem registos atómicos como o <code>BSRR</code>. <em>(Módulos 03–04)</em></p>
+
+<!-- ===================== GPIO ===================== -->
+<span class="section-tag">GPIO</span>
+<h2>Entradas/saídas de uso geral</h2>
+
+<h4>CRL / CRH</h4>
+<p>Os <strong>registos de configuração</strong> do GPIO do STM32F1: o <code>CRL</code> configura os pinos 0–7, o <code>CRH</code> os pinos 8–15, usando 4 bits por pino (2 MODE + 2 CNF). A família F1 <strong>não tem registo <code>MODER</code></strong> (isso é uma funcionalidade do F0/F3/F4). <em>(Módulo 04)</em></p>
+
+<h4>Bits MODE / CNF</h4>
+<p>O campo de 4 bits por pino no CRL/CRH: <strong>MODE</strong> seleciona entrada vs saída (e a velocidade de saída); <strong>CNF</strong> seleciona o tipo (push-pull / open-drain / função alternativa para saídas; analógico / flutuante / pull-up-down para entradas). <em>(Módulos 04–05)</em></p>
+
+<h4>IDR / ODR</h4>
+<p><strong>I</strong>nput <strong>D</strong>ata <strong>R</strong>egister (lê os níveis dos pinos) e <strong>O</strong>utput <strong>D</strong>ata <strong>R</strong>egister (impõe os níveis dos pinos). <em>(Módulos 04–05)</em></p>
+
+<h4>BSRR (Bit Set/Reset Register)</h4>
+<p>Escrever o bit <em>n</em> coloca o pino <em>n</em> a 1; escrever o bit <em>n</em>+16 coloca-o a 0. Uma única escrita atómica altera apenas os pinos que indicares — sem read-modify-write, sem condição de corrida. <em>(Módulo 04)</em></p>
+
+<h4>Função alternativa (AF)</h4>
+<p>Um modo de pino (CNF = AF push-pull/open-drain) que entrega o pino a um periférico, como um USART, timer, I²C ou SPI, em vez de GPIO simples. P. ex. PA9 como TX do USART1. <em>(Módulos 06+)</em></p>
+
+<!-- ===================== UART ===================== -->
+<span class="section-tag">UART / Série</span>
+<h2>Comunicação série</h2>
+
+<h4>USART / UART</h4>
+<p>(Universal Synchronous/Asynchronous Receiver-Transmitter.) O periférico série do STM32. Em modo assíncrono (UART) enquadra os bytes com bits de início/paragem a um baud rate acordado. Base do USART1 <code>0x40013800</code>. <em>(Módulos 06–07)</em></p>
+
+<h4>Baud rate / BRR</h4>
+<p>O ritmo de bits da linha série. O Baud Rate Register codifica <code>f<sub>ck</sub> / (16 × baud)</code>. Para 8 MHz / 9600 baud, <code>BRR = 0x0341</code>. <em>(Módulo 06)</em></p>
+
+<h4>TXE / TC / RXNE</h4>
+<p>Flags de estado do USART: <strong>TXE</strong> = registo de dados de transmissão vazio (pode escrever-se o próximo byte); <strong>TC</strong> = transmissão completa (último bit enviado); <strong>RXNE</strong> = registo de dados de receção não vazio (chegou um byte). <em>(Módulos 06–07)</em></p>
+
+<h4>Redirecionar o <code>printf</code></h4>
+<p>Redirecionar a saída da biblioteca C para o teu hardware implementando a syscall de baixo nível <code>_write()</code> para que envie caracteres para a UART. Com <code>stdout</code> sem buffer, isto não precisa de heap. <em>(Módulo 06)</em></p>
+
+<h4>Semihosting</h4>
+<p>Um mecanismo de depuração em que o alvo pede ao host/depurador que execute I/O (p. ex. saída para a consola) através de um breakpoint especial. Uma alternativa à UART para ver a saída; este curso usa UART porque funciona de forma limpa sob o encaminhamento série do QEMU. <em>(Módulo 06)</em></p>
+
+<!-- ===================== TIMERS / IRQ ===================== -->
+<span class="section-tag">Timers e Interrupções</span>
+<h2>Tempo e eventos</h2>
+
+<h4>SysTick</h4>
+<p>Um simples contador decrescente de 24 bits incorporado em todos os núcleos Cortex-M (em <code>0xE000E010</code>), comummente usado para um tick periódico de milissegundo. Registos: CSR (controlo), RVR (recarga), CVR (atual). <em>(Módulo 08)</em></p>
+
+<h4>Prescaler (PSC) / Auto-recarga (ARR)</h4>
+<p>Num timer de uso geral, o <code>PSC</code> divide o relógio de entrada (por PSC+1) para definir o ritmo de contagem, e o <code>ARR</code> define a contagem à qual o timer dá a volta e gera um evento de atualização. <em>(Módulo 09)</em></p>
+
+<h4>Output Compare / PWM</h4>
+<p>Um modo de timer que comuta ou aciona um pino quando o contador iguala um valor de comparação (CCRx) — usado para gerar sinais PWM (de duty-cycle variável). <em>(Módulo 09)</em></p>
+
+<h4>Input Capture</h4>
+<p>Um modo de timer que regista (latches) o valor do contador em CCRx num flanco de entrada — usado para medir larguras de impulso ou a frequência de um sinal. <em>(Módulo 09)</em></p>
+
+<h4>Exceção / Interrupção (IRQ)</h4>
+<p>Um evento que desvia o CPU para um handler através da tabela de vetores. As exceções de sistema (Reset, HardFault, SysTick…) têm posições fixas; as interrupções de periféricos (IRQs) são numeradas segundo a Tabela 51 do RM0041. <em>(Módulo 10)</em></p>
+
+<h4>NVIC (Nested Vectored Interrupt Controller)</h4>
+<p>A unidade do Cortex-M que ativa/prioriza interrupções. Ativas a IRQ <em>n</em> escrevendo o bit <em>n</em>%32 de <code>NVIC_ISER[n/32]</code> (base <code>0xE000E100</code>). Também trata do aninhamento (nesting) e da salvaguarda/restauro automático de contexto. <em>(Módulo 10)</em></p>
+
+<h4>EXTI (External Interrupt/Event Controller)</h4>
+<p>Encaminha os flancos dos pinos GPIO (e algumas fontes internas) para as linhas de interrupção do NVIC, com seleção de flanco ascendente/descendente e um bit de pendência que limpas no handler. <em>(Módulo 10)</em></p>
+
+<!-- ===================== DMA / BUSES ===================== -->
+<span class="section-tag">DMA e Barramentos Série</span>
+<h2>Movimentação de dados e barramentos de dispositivos</h2>
+
+<h4>DMA (Direct Memory Access)</h4>
+<p>Um controlador que move dados entre a memória e os periféricos sem envolvimento do CPU, libertando o núcleo. No F100, o DMA1 tem 7 canais; o USART1-TX usa o canal 4. Base <code>0x40020000</code>. <em>(Módulo 11)</em></p>
+
+<h4>I²C (Inter-Integrated Circuit)</h4>
+<p>Um barramento multiponto de dois fios (relógio SCL, dados SDA) onde um mestre endereça dispositivos escravos de 7 bits com handshaking ACK/NACK e condições de START/STOP. <em>(Módulo 12)</em></p>
+
+<h4>SPI (Serial Peripheral Interface)</h4>
+<p>Um barramento full-duplex de quatro fios (SCK, MOSI, MISO, chip-select) sem endereçamento; o mestre desloca dados para fora e para dentro em simultâneo. A polaridade/fase do relógio são definidas por CPOL/CPHA. <em>(Módulo 13)</em></p>
+
+<h4>APB1 / APB2 / AHB</h4>
+<p>Os barramentos internos de periféricos. O AHB é o barramento rápido (DMA, o gating da árvore de relógio do GPIO do núcleo); o APB2 aloja os periféricos de maior velocidade (GPIO, USART1, SPI1, TIM1); o APB1 aloja os restantes (USART2/3, I²C, SPI2, TIM2/3/4). O barramento em que um periférico se encontra determina qual o registo <code>…ENR</code> do RCC que o ativa. <em>(Módulos 03+)</em></p>
+
+<!-- ===================== TOOLING ===================== -->
+<span class="section-tag">Toolchain e QEMU</span>
+<h2>Compilar e executar</h2>
+
+<h4><code>arm-none-eabi-gcc</code></h4>
+<p>O compilador cruzado ARM bare-metal (SO "none", EABI) usado para compilar todo o firmware. Ferramentas associadas: <code>objdump</code> (desmontar), <code>objcopy</code> (criar um binário em bruto), <code>readelf</code> (inspecionar secções), <code>size</code>. <em>(Módulos 01–02, todas as compilações)</em></p>
+
+<h4>newlib / nano.specs</h4>
+<p>A pequena biblioteca C usada para alvos embebidos; <code>--specs=nano.specs</code> seleciona a variante otimizada em tamanho (<code>printf</code> só com inteiros). <code>--specs=nosys.specs</code> fornece syscalls de SO em stub que podes substituir. <em>(Módulo 06)</em></p>
+
+<h4>QEMU <code>-M stm32vldiscovery</code></h4>
+<p>A máquina QEMU que emula o Cortex-M3 e os USARTs desta placa. <strong>Não</strong> modela GPIO, timers, DMA nem I²C — ver a tabela de emulação no <a href="README-pt.md">README</a>. <em>(Todos os módulos)</em></p>
+
+<h4>A regra de encaminhamento dos 3 series</h4>
+<p>Como a máquina tem três USARTs, o QEMU precisa de um backend para cada um. Executa com
+<code>-serial stdio -serial null -serial null</code> para que o USART1 chegue ao teu terminal;
+um simples <code>-serial stdio</code> dá erro. <em>(Módulo 06)</em></p>
+
+<hr>
+<p class="muted">Regressa ao <a href="README-pt.md">início do curso</a> ou salta para o <a href="01-arm-architecture/01-arm-architecture-pt.html">Módulo 01</a>.</p>
+
+</div>
+</body>
+</html>

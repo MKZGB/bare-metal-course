@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>08 · Temporizador SysTick — Bare-Metal STM32</title>
+<link rel="stylesheet" href="../common/style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <a href="../README-pt.md">Início</a>
+  <a href="../glossary-pt.html">Glossário</a>
+  <a href="../07-uart-receive/07-uart-receive-pt.html">‹ Anterior</a>
+  <a href="../09-general-purpose-timers/09-general-purpose-timers-pt.html">Seguinte ›</a>
+  <a href="08-systick-timer.html">🌐 English</a>
+  <span class="spacer"></span>
+  <span class="badge">STM32F100RBT6 · PM0056</span>
+</nav>
+
+<div class="wrap">
+
+<h1><span class="modnum">Módulo 08</span> Temporizador SysTick — Um Tique de Milissegundo Preciso</h1>
+<p class="subtitle">Usa o temporizador <code>SysTick</code> do núcleo Cortex-M3 para construir um verdadeiro <code>delay_ms()</code> e um relógio de tempo de funcionamento em milissegundos, depois imprime um contador crescente uma vez por segundo através da UART.</p>
+
+<div class="box note">
+  <span class="box-title">Dependências</span>
+  Este módulo reutiliza a transmissão UART + o redirecionamento do <code>printf</code> do <a href="../06-uart-transmit/06-uart-transmit-pt.html">Módulo 06</a>. As interrupções são introduzidas aqui de forma informal (a exceção SysTick); o <a href="../10-interrupts-nvic/10-interrupts-nvic-pt.html">Módulo 10</a> cobre o NVIC na íntegra. Já deves estar à vontade com o acesso a registos via <code>volatile</code> dos Módulos 03–04.
+</div>
+
+<div class="box ok">
+  <span class="box-title">Este é totalmente visível no QEMU</span>
+  Ao contrário do GPIO e dos temporizadores de uso geral, o <code>SysTick</code> é um periférico do <em>núcleo</em> do Cortex-M3 e o QEMU emula-o <strong>por completo</strong> — conta, ativa o <code>COUNTFLAG</code> e dispara a exceção <code>SysTick</code>. Combinado com o USART1 (também totalmente emulado), vais ver valores reais e crescentes de tempo de funcionamento a percorrer o teu terminal.
+</div>
+
+<!-- ============================== THEORY ============================== -->
+<span class="section-tag">Teoria</span>
+<h2>1. Para que serve o SysTick</h2>
+
+<p>O Módulo 04 usou uma espera ativa com um ciclo <code>for</code> para a temporização — simples, mas a duração depende do compilador, do nível de otimização e da velocidade do relógio. É adivinhação não medida. Quase todos os sistemas embebidos querem, em vez disso, um <strong>tique periódico conhecido</strong>: um batimento cardíaco que dispara a cada <em>N</em> milissegundos para que o software possa agendar trabalho, expirar operações por tempo limite e medir o tempo decorrido.</p>
+
+<p>O Cortex-M3 traz um incorporado. O <strong>SysTick</strong> é um contador decrescente de 24 bits que vive dentro do núcleo do CPU (não num barramento de periféricos), por isso existe em <em>todos</em> os Cortex-M3 independentemente do fabricante. Conta de forma decrescente a partir de um valor de recarga até 0, opcionalmente levanta a exceção <code>SysTick</code> quando atinge 0, e depois recarrega automaticamente e continua. Foi concebido precisamente para gerar o tique de um RTOS — mas funciona igualmente bem em bare-metal.</p>
+
+<h3>1.1 Os quatro registos (PM0056, @ <code>0xE000E010</code>)</h3>
+
+<table>
+  <tr><th>Registo</th><th>Endereço</th><th>Finalidade</th></tr>
+  <tr><td><code>SYST_CSR</code></td><td><code>0xE000E010</code></td><td>Controlo e estado</td></tr>
+  <tr><td><code>SYST_RVR</code></td><td><code>0xE000E014</code></td><td>Valor de recarga (24 bits)</td></tr>
+  <tr><td><code>SYST_CVR</code></td><td><code>0xE000E018</code></td><td>Valor atual (a escrita limpa)</td></tr>
+  <tr><td><code>SYST_CALIB</code></td><td><code>0xE000E01C</code></td><td>Calibração (não usado aqui)</td></tr>
+</table>
+
+<h3>1.2 O registo de controlo/estado, <code>SYST_CSR</code></h3>
+
+<table>
+  <tr><th>Bit</th><th>Nome</th><th>Significado</th></tr>
+  <tr><td>0</td><td><code>ENABLE</code></td><td>1 = o contador está em funcionamento.</td></tr>
+  <tr><td>1</td><td><code>TICKINT</code></td><td>1 = assere a exceção <code>SysTick</code> sempre que o contador atinge 0.</td></tr>
+  <tr><td>2</td><td><code>CLKSOURCE</code></td><td>Seleção do relógio: <strong>1 = relógio do processador (HCLK)</strong>, 0 = relógio de referência externo.</td></tr>
+  <tr><td>16</td><td><code>COUNTFLAG</code></td><td>Lê 1 se o contador atingiu 0 desde a última leitura deste registo. <strong>Ler o <code>CSR</code> limpa-o.</strong></td></tr>
+</table>
+
+<h3>1.3 O valor de recarga, <code>SYST_RVR</code></h3>
+<p>Quando o contador atinge 0, o hardware carrega-o com <code>SYST_RVR</code> no relógio seguinte e continua a contar. Para obter um período de <em>N</em> tiques do relógio de entrada escreves <strong><code>RVR = N − 1</code></strong> (o contador visita <em>N</em> estados: <code>N−1, N−2, … 1, 0</code>).</p>
+
+<div class="box note">
+  <span class="box-title">O cálculo da recarga de 1 ms</span>
+  Após o reset, o chip corre no oscilador interno HSI a <strong>8 MHz</strong> (RM0041 §7), e com <code>CLKSOURCE=1</code> o SysTick é alimentado por esse relógio de processador de 8 MHz. Um milissegundo são 8&nbsp;000 tiques de relógio, por isso:
+  <div class="diagram">RVR = (8 000 000 Hz / 1000 Hz) − 1 = 8000 − 1 = <strong>7999</strong></div>
+  Este é o único número que tens de calcular neste módulo.
+</div>
+
+<h3>1.4 O valor atual, <code>SYST_CVR</code></h3>
+<p>Ler o <code>CVR</code> devolve o contador em tempo real. <em>Escrever</em> qualquer valor nele limpa o contador para 0 e também limpa o <code>COUNTFLAG</code>; os dados que escreveste são ignorados. Escreves nele uma vez durante a configuração para que o primeiro período completo comece de forma limpa a partir do valor de recarga.</p>
+
+<div class="box danger">
+  <span class="box-title">⚠ Contador de 24 bits — recarga máxima</span>
+  O <code>RVR</code> e o <code>CVR</code> têm apenas <strong>24 bits</strong> de largura. A maior recarga é <code>0xFFFFFF = 16 777 215</code>. A 8 MHz esse é o período único de SysTick mais longo possível — cerca de <code>16 777 216 / 8 000 000 ≈ 2.097 s</code>. Para intervalos mais longos contas vários tiques em software (que é exatamente o que o nosso tempo de funcionamento de 1 segundo faz: 1000 × tiques de 1 ms).
+</div>
+
+<h2>2. Duas formas de o usar</h2>
+
+<h3>2.1 Estilo A — sondar o <code>COUNTFLAG</code> (bloqueante)</h3>
+<p>Para um atraso bloqueante de uma única vez podes deixar o <code>TICKINT</code> desligado e simplesmente sondar o <code>COUNTFLAG</code> num ciclo. Cada vez que lê 1, decorreu um período de recarga completo:</p>
+<pre><code>/* atraso bloqueante de 'ticks' periodos, sem interrupcao */
+SYST_RVR = 7999U;                       /* periodo de 1 ms        */
+SYST_CVR = 0U;                          /* limpar                 */
+SYST_CSR = CSR_CLKSOURCE | CSR_ENABLE;  /* correr, SEM TICKINT    */
+while (ticks &gt; 0U) {
+    while ((SYST_CSR &amp; CSR_COUNTFLAG) == 0U) { /* esperar um periodo */ }
+    ticks--;                             /* a leitura acima limpou o COUNTFLAG */
+}</code></pre>
+<p>Simples, mas o CPU fica preso em espera ativa e não pode fazer mais nada.</p>
+
+<h3>2.2 Estilo B — orientado a interrupções (um relógio em funcionamento contínuo)</h3>
+<p>Define <code>TICKINT=1</code> e o temporizador levanta a exceção <code>SysTick</code> em cada período. Um pequeno manipulador incrementa um contador, e o resto do teu programa lê esse contador sempre que quer saber o tempo. É isto que construímos no exercício — dá um relógio de milissegundos em funcionamento contínuo que custa quase nada.</p>
+
+<div class="box note">
+  <span class="box-title">Nenhuma linha do NVIC para ativar</span>
+  O <code>SysTick</code> é uma <em>exceção de sistema</em> do Cortex-M3 (posição de vetor 15), não um IRQ externo, por isso <strong>não</strong> tocas nos registos <code>ISER</code> do NVIC para o ativar — o bit <code>TICKINT</code> é o seu ativador. O nome do manipulador é <code>SysTick_Handler</code>, que já é um símbolo <code>WEAK</code> em <code>common/startup.c</code>; definir uma função com esse nome exato sobrepõe-no.
+</div>
+
+<h3>2.3 Porque é que o contador tem de ser <code>volatile</code></h3>
+<p>O contador de tiques é escrito pelo manipulador de interrupção e lido pelo <code>main()</code>. Do ponto de vista do <code>main()</code>, nada no seu próprio código linear altera alguma vez essa variável — por isso um compilador otimizador tem o direito de a ler <em>uma vez</em> para um registo do CPU e reutilizar essa cópia em cache. Um ciclo de atraso construído sobre um valor em cache nunca veria as atualizações do manipulador e ficaria a <strong>girar para sempre</strong>. Declará-la como <code>volatile uint32_t</code> diz ao compilador "isto pode mudar nas tuas costas — relê-a da memória todas as vezes." Este é o uso canónico do <code>volatile</code>: uma variável partilhada entre uma ISR e o código principal.</p>
+
+<!-- ============================== EXERCISE ============================== -->
+<span class="section-tag">Exercício Guiado</span>
+<h2>3. Um relógio de milissegundos que imprime o tempo de funcionamento</h2>
+
+<p><strong>Objetivo:</strong> gerar uma interrupção SysTick de 1 ms que incrementa uma contagem global de tiques, implementar o <code>delay_ms()</code> sobre ela, e fazer o <code>main()</code> imprimir <code>"Uptime: N s"</code> uma vez por segundo através do USART1. Vais:</p>
+<ol>
+  <li>Inicializar o USART1 + o redirecionamento do <code>printf</code> (trazido do Módulo 06).</li>
+  <li>Calcular o valor de recarga de 1 ms e programar <code>RVR</code>/<code>CVR</code>/<code>CSR</code>.</li>
+  <li>Escrever o <code>SysTick_Handler</code> para incrementar um contador <code>volatile</code>.</li>
+  <li>Escrever o <code>delay_ms()</code> que espera que o contador avance.</li>
+</ol>
+
+<h3>3.1 Esqueleto — cria <code>08-systick-timer/main.c</code></h3>
+<p>Preenche cada <code>TODO</code>. Os auxiliares da UART são dados completos para que te possas concentrar no SysTick.</p>
+
+<pre><code>#include &lt;stdint.h&gt;
+#include &lt;stdio.h&gt;
+
+/* ---- Registos do SysTick (nucleo Cortex-M3, PM0056) --------------- */
+#define SYST_CSR   (*(volatile uint32_t *)0xE000E010U)
+#define SYST_RVR   (*(volatile uint32_t *)0xE000E014U)
+#define SYST_CVR   (*(volatile uint32_t *)0xE000E018U)
+
+#define CSR_ENABLE     (1U &lt;&lt; 0)
+#define CSR_TICKINT    (1U &lt;&lt; 1)
+#define CSR_CLKSOURCE  (1U &lt;&lt; 2)
+#define CSR_COUNTFLAG  (1U &lt;&lt; 16)
+
+/* ---- USART1 (dado: ver Modulo 06) --------------------------------- */
+#define RCC_APB2ENR  (*(volatile uint32_t *)0x40021018U)
+#define GPIOA_CRH    (*(volatile uint32_t *)0x40010804U)
+#define USART1_SR    (*(volatile uint32_t *)0x40013800U)
+#define USART1_DR    (*(volatile uint32_t *)0x40013804U)
+#define USART1_BRR   (*(volatile uint32_t *)0x40013808U)
+#define USART1_CR1   (*(volatile uint32_t *)0x4001380CU)
+#define USART_SR_TXE (1U &lt;&lt; 7)
+
+/* O contador de tiques, partilhado entre a ISR e o main().
+ * TODO 1: que qualificador TEM de ter, e porque? Adiciona-o. */
+static /* ??? */ uint32_t g_msticks = 0U;
+
+/* ---- Manipulador da excecao SysTick ------------------------------- */
+void SysTick_Handler(void)
+{
+    /* TODO 2: avanca a contagem de tiques de milissegundo em um. */
+}
+
+static void systick_init(uint32_t reload)
+{
+    /* TODO 3: programa o valor de recarga de 24 bits (RVR). */
+    /* TODO 4: limpa o valor atual (CVR) para que o primeiro periodo seja limpo. */
+    /* TODO 5: ativa o contador com: relogio do processador + interrupcao + correr.
+     *         (que tres bits do CSR?) */
+}
+
+static void delay_ms(uint32_t ms)
+{
+    /* TODO 6: captura g_msticks, depois gira ate ter avancado 'ms'.
+     *         Usar subtracao sem sinal trata corretamente o wrap do contador. */
+}
+
+/* ---- UART + redirecionamento do printf (dado completo) ------------ */
+static void uart_init(void)
+{
+    RCC_APB2ENR |= (1U &lt;&lt; 2) | (1U &lt;&lt; 14);            /* IOPAEN | USART1EN  */
+    GPIOA_CRH = (GPIOA_CRH &amp; ~(0xFU &lt;&lt; 4)) | (0xBU &lt;&lt; 4); /* PA9 AF PP 50MHz */
+    USART1_BRR = 0x0341U;                            /* 9600 @ 8 MHz      */
+    USART1_CR1 = (1U &lt;&lt; 3) | (1U &lt;&lt; 13);              /* TE | UE           */
+}
+static void uart_putc(char c)
+{
+    while ((USART1_SR &amp; USART_SR_TXE) == 0U) { }
+    USART1_DR = (uint32_t)((uint8_t)c);
+}
+int _write(int fd, const char *buf, int len)
+{
+    int i; (void)fd;
+    for (i = 0; i &lt; len; i++) {
+        if (buf[i] == '\n') { uart_putc('\r'); }
+        uart_putc(buf[i]);
+    }
+    return len;
+}
+
+int main(void)
+{
+    uint32_t seconds = 0U;
+
+    uart_init();
+    setvbuf(stdout, NULL, _IONBF, 0);   /* sem buffer: nao precisa de heap */
+
+    /* TODO 7: que valor de recarga da um tique de 1 ms a 8 MHz? Passa-o. */
+    systick_init(/* ??? */);
+
+    for (;;)
+    {
+        delay_ms(1000U);
+        seconds++;
+        printf("Uptime: %u s\n", (unsigned)seconds);
+    }
+    return 0;
+}
+</code></pre>
+
+<h3>3.2 Compilar e correr</h3>
+<p>De dentro da pasta <code>08-systick-timer/</code>:</p>
+<pre><code>make -f ../common/Makefile SRC=main.c run</code></pre>
+<p>Deverás ver, uma vez por segundo:</p>
+<pre><code>Uptime: 1 s
+Uptime: 2 s
+Uptime: 3 s
+...</code></pre>
+<p>Sai do QEMU com <kbd>Ctrl-A</kbd> e depois <kbd>X</kbd>. Critério de sucesso: o contador imprime valores crescentes, aproximadamente um por cada segundo real.</p>
+
+<h3>3.3 Dicas</h3>
+<details class="hint">
+  <summary>Dica 1 — o valor de recarga e a ativação do CSR</summary>
+  <p>1 ms a 8 MHz são 8000 relógios de entrada, por isso <code>RVR = 8000 − 1 = 7999</code>. Ativa com os três bits ao mesmo tempo: <code>SYST_CSR = CSR_CLKSOURCE | CSR_TICKINT | CSR_ENABLE;</code> (relógio do processador, levantar a exceção no zero, e correr).</p>
+</details>
+<details class="hint">
+  <summary>Dica 2 — o manipulador e o contador volatile</summary>
+  <p>O <code>g_msticks</code> tem de ser <code>static volatile uint32_t</code>. O corpo do manipulador é uma linha: <code>g_msticks++;</code>. Entrar na exceção confirma-a automaticamente — não precisas de ler/limpar o <code>COUNTFLAG</code> em modo de interrupção.</p>
+</details>
+<details class="hint">
+  <summary>Dica 3 — implementar o delay_ms()</summary>
+  <p>Captura o início, depois faz um ciclo sobre a diferença:</p>
+  <pre><code>uint32_t start = g_msticks;
+while ((g_msticks - start) &lt; ms) { /* girar */ }</code></pre>
+  <p>A subtração sem sinal significa que o teste se mantém correto mesmo quando o <code>g_msticks</code> dá a volta para além de <code>0xFFFFFFFF</code>. Como o <code>g_msticks</code> é <code>volatile</code>, cada iteração do ciclo relê-o da memória.</p>
+</details>
+<details class="hint">
+  <summary>Dica 4 — limpar o CVR</summary>
+  <p>Qualquer escrita limpa-o; o valor é ignorado. Basta fazer <code>SYST_CVR = 0U;</code> antes de ativar, para que o primeiro período medido seja uma recarga completa em vez do lixo que estava no contador no reset.</p>
+</details>
+
+<div class="box ok">
+  <span class="box-title">Solução de referência</span>
+  Solução completa e comentada: <code>solutions/08-systick-timer.c</code>. Tenta todas as dicas primeiro.
+</div>
+
+<!-- ============================== QUESTIONS ============================== -->
+<span class="section-tag">Perguntas de Verificação</span>
+<h2>4. Verifica a tua compreensão</h2>
+
+<details class="answer">
+  <summary>P1. Porque é que o valor de recarga é 7999 e não 8000 para um tique de 1 ms a 8 MHz?</summary>
+  <p>O contador conta de forma decrescente por cada valor desde a recarga até 0 inclusive, o que são <em>recarga + 1</em> estados. Para abranger exatamente 8000 tiques de relógio (1 ms a 8 MHz) precisas de 8000 estados, por isso <code>RVR = 8000 − 1 = 7999</code>. Escrever 8000 daria um período de 8001 tiques — errado por um.</p>
+</details>
+<details class="answer">
+  <summary>P2. Porque é que o contador de tiques tem de ser declarado <code>volatile</code>?</summary>
+  <p>É escrito pela ISR <code>SysTick_Handler</code> e lido pelo <code>main()</code>. O compilador não consegue ver que a ISR corre, por isso sem <code>volatile</code> pode pôr a variável em cache num registo e reutilizar o valor obsoleto — fazendo o <code>delay_ms()</code> girar para sempre. O <code>volatile</code> força uma leitura fresca da memória em cada acesso, que é exatamente o que uma variável partilhada entre uma interrupção e o código principal requer.</p>
+</details>
+<details class="answer">
+  <summary>P3. Quando é que sondarias o <code>COUNTFLAG</code> em vez de usar a interrupção?</summary>
+  <p>A sondagem (Estilo A) serve para um atraso bloqueante simples de uma única vez quando o CPU não tem mais nada para fazer e não queres nenhuma ISR. A interrupção (Estilo B) é melhor para um relógio em funcionamento contínuo: o temporizador mantém a contagem de tiques em segundo plano enquanto o <code>main()</code> faz outro trabalho e apenas lê a contagem quando necessário. Nota que ler o <code>CSR</code> limpa o <code>COUNTFLAG</code>, por isso um ciclo de sondagem consome a flag cada vez que a observa.</p>
+</details>
+<details class="answer">
+  <summary>P4. O que é que o bit <code>CLKSOURCE</code> seleciona, e o que usamos?</summary>
+  <p>O <code>CLKSOURCE</code> escolhe o relógio de entrada do SysTick: <strong>1 = o relógio do processador (HCLK)</strong>, 0 = um relógio de referência externo (um relógio definido pela implementação, tipicamente mais lento e dividido). Definimo-lo a 1 para que o SysTick seja acionado pelo relógio de processador HSI completo de 8 MHz, que é o que o cálculo de recarga 7999 assume.</p>
+</details>
+<details class="answer">
+  <summary>P5. Qual é o período único mais longo que o SysTick consegue produzir a 8 MHz, e porquê?</summary>
+  <p>O <code>RVR</code>/<code>CVR</code> têm 24 bits, por isso a recarga máxima é <code>0xFFFFFF = 16 777 215</code>, dando 16 777 216 tiques de relógio por período. A 8 MHz isso são cerca de <code>16 777 216 / 8 000 000 ≈ 2.10 s</code>. Para intervalos mais longos (como o nosso 1 segundo construído a partir de 1000 × 1 ms) acumulas vários tiques curtos em software em vez de pedir um período enorme.</p>
+</details>
+<details class="answer">
+  <summary>P6. Precisas de ativar um IRQ de SysTick no NVIC?</summary>
+  <p>Não. O SysTick é uma <em>exceção de sistema</em> do Cortex-M3 (ranhura de vetor 15), não uma das linhas de IRQ de periférico. O seu ativador é o bit <code>TICKINT</code> em <code>SYST_CSR</code>; os registos <code>ISER</code> do NVIC controlam apenas os IRQ externos (cobertos no Módulo 10). Definir <code>TICKINT|ENABLE</code> é tudo o que é necessário para começar a receber chamadas a <code>SysTick_Handler</code>.</p>
+</details>
+
+<div class="modfooter">
+  <a href="../07-uart-receive/07-uart-receive-pt.html">← 07 · Receção UART</a>
+  <a href="../09-general-purpose-timers/09-general-purpose-timers-pt.html">09 · Temporizadores de Uso Geral →</a>
+</div>
+
+</div>
+</body>
+</html>

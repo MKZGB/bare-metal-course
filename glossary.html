@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Glossary — Bare-Metal STM32 Course</title>
+<link rel="stylesheet" href="common/style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <a href="README.md">Home</a>
+  <a href="01-arm-architecture/01-arm-architecture.html">Module 01</a>
+  <a href="glossary-pt.html">🌐 Português</a>
+  <span class="spacer"></span>
+  <span class="badge">STM32F100RBT6 · RM0041</span>
+</nav>
+
+<div class="wrap">
+
+<h1><span class="modnum">Reference</span> Glossary</h1>
+<p class="subtitle">Key terms used across the course, defined once for consistency. Terms are grouped by theme; within each group they build on one another.</p>
+
+<div class="box note">
+  <span class="box-title">How to use this page</span>
+  Skim it once before Module 01, then return whenever a term in a module is unfamiliar. Register names link conceptually to the module that uses them.
+</div>
+
+<!-- ===================== ARCHITECTURE ===================== -->
+<span class="section-tag">Architecture &amp; Core</span>
+<h2>ARM / Cortex-M concepts</h2>
+
+<h4>RISC (Reduced Instruction Set Computer)</h4>
+<p>A CPU design philosophy favouring many simple, fixed-length, single-cycle-ish instructions over few complex ones. ARM is a RISC architecture. <em>(Module 01)</em></p>
+
+<h4>Load-store architecture</h4>
+<p>A RISC trait: arithmetic/logic instructions operate <strong>only on registers</strong>; memory is touched <strong>only</strong> by dedicated load (<code>ldr</code>) and store (<code>str</code>) instructions. <em>(Module 01)</em></p>
+
+<h4>Cortex-M3</h4>
+<p>The ARM processor core inside the STM32F100. Implements the ARMv7-M architecture, runs the Thumb-2 instruction set, is little-endian, and has a 3-stage pipeline. <em>(Modules 01–02)</em></p>
+
+<h4>Thumb / Thumb-2</h4>
+<p>Compact 16/32-bit instruction encodings that improve code density on flash-constrained MCUs. Cortex-M cores execute Thumb-2 exclusively; the "T" bit in the EPSR must stay 1. <em>(Modules 01–02)</em></p>
+
+<h4>Core registers (R0–R15)</h4>
+<p>R0–R12 are general-purpose. R13 = <strong>SP</strong> (stack pointer), R14 = <strong>LR</strong> (link register, holds the return address), R15 = <strong>PC</strong> (program counter). <em>(Module 02)</em></p>
+
+<h4>MSP / PSP</h4>
+<p>The two banked stack pointers selected by R13: the <strong>Main</strong> Stack Pointer (used at reset and in handlers) and the <strong>Process</strong> Stack Pointer (often used by thread/task code under an RTOS). This course uses MSP only. <em>(Module 02)</em></p>
+
+<h4>xPSR (APSR / IPSR / EPSR)</h4>
+<p>The Program Status Register. <strong>APSR</strong> holds condition flags (N, Z, C, V); <strong>IPSR</strong> holds the number of the exception currently executing (0 in thread mode); <strong>EPSR</strong> holds execution state including the Thumb bit. <em>(Module 02)</em></p>
+
+<h4>Thread mode / Handler mode</h4>
+<p>Thread mode runs normal code; the core enters Handler mode automatically to run an exception/interrupt handler. <em>(Modules 02, 10)</em></p>
+
+<!-- ===================== STARTUP ===================== -->
+<span class="section-tag">Startup &amp; Memory</span>
+<h2>Getting from reset to <code>main()</code></h2>
+
+<h4>Vector table</h4>
+<p>An array at the start of Flash (<code>0x08000000</code>) whose entries are the initial stack pointer (entry 0) followed by the addresses of the reset handler and every exception/interrupt handler. The hardware indexes it by exception number. Defined in <code>common/startup.c</code>. <em>(Modules 02, 10)</em></p>
+
+<h4>Reset handler</h4>
+<p>The first code that runs after reset. It copies initialised data from Flash to RAM, zeroes the <code>.bss</code> section, then calls <code>main()</code>. See <code>Reset_Handler</code> in <code>common/startup.c</code>. <em>(Module 02)</em></p>
+
+<h4>.data / .bss</h4>
+<p><code>.data</code> = globals with non-zero initial values (stored in Flash, copied to RAM at startup). <code>.bss</code> = globals initialised to zero (no Flash storage; the startup code zeroes the RAM). <em>(Module 02)</em></p>
+
+<h4>Linker script (<code>linker.ld</code>)</h4>
+<p>Tells the linker the chip's memory map (Flash at <code>0x08000000</code>, SRAM at <code>0x20000000</code>) and which sections go where, including the <em>load</em> vs <em>run</em> address split for <code>.data</code>. <em>(Modules 02–03)</em></p>
+
+<h4>VMA / LMA</h4>
+<p>Virtual Memory Address (where a section is <em>accessed</em> at run time, e.g. <code>.data</code> in RAM) vs Load Memory Address (where its image is <em>stored</em>, e.g. in Flash). The startup code bridges the two. <em>(Module 02)</em></p>
+
+<!-- ===================== MMIO ===================== -->
+<span class="section-tag">Registers &amp; MMIO</span>
+<h2>Talking to hardware</h2>
+
+<h4>MMIO (Memory-Mapped I/O)</h4>
+<p>Peripheral control registers appear at fixed addresses in the CPU's address space; reading/writing those addresses controls the hardware. STM32 peripherals start at <code>0x40000000</code>; core peripherals (NVIC, SysTick) at <code>0xE000E000</code>. <em>(Module 03)</em></p>
+
+<h4><code>volatile</code></h4>
+<p>A C qualifier telling the compiler a variable/register may change outside the program's control, so every access must really happen and must not be reordered or cached. Mandatory for MMIO registers and for variables shared with interrupt handlers. <em>(Modules 03, 10)</em></p>
+
+<h4>RCC (Reset and Clock Control)</h4>
+<p>The peripheral that gates each other peripheral's clock. A peripheral with its clock off ignores all register writes — so you enable its clock in an RCC <code>…ENR</code> register first. Base <code>0x40021000</code>. <em>(Modules 03–04)</em></p>
+
+<h4>Clock gating</h4>
+<p>Switching a peripheral's clock on/off to save power. Forgetting to enable a clock is the classic "my driver does nothing" bug. <em>(Module 04)</em></p>
+
+<h4>Read-modify-write</h4>
+<p>Reading a register, changing some bits with mask/shift operations, and writing it back — used to set a field without disturbing the others. Can race with interrupts, which is why atomic registers like <code>BSRR</code> exist. <em>(Modules 03–04)</em></p>
+
+<!-- ===================== GPIO ===================== -->
+<span class="section-tag">GPIO</span>
+<h2>General-purpose I/O</h2>
+
+<h4>CRL / CRH</h4>
+<p>The STM32F1 GPIO <strong>configuration registers</strong>: <code>CRL</code> configures pins 0–7, <code>CRH</code> pins 8–15, using 4 bits per pin (2 MODE + 2 CNF). The F1 family has <strong>no <code>MODER</code> register</strong> (that is an F0/F3/F4 feature). <em>(Module 04)</em></p>
+
+<h4>MODE / CNF bits</h4>
+<p>The 4-bit per-pin field in CRL/CRH: <strong>MODE</strong> selects input vs output (and output speed); <strong>CNF</strong> selects the flavour (push-pull / open-drain / alternate-function for outputs; analog / floating / pull-up-down for inputs). <em>(Modules 04–05)</em></p>
+
+<h4>IDR / ODR</h4>
+<p><strong>I</strong>nput <strong>D</strong>ata <strong>R</strong>egister (read pin levels) and <strong>O</strong>utput <strong>D</strong>ata <strong>R</strong>egister (drive pin levels). <em>(Modules 04–05)</em></p>
+
+<h4>BSRR (Bit Set/Reset Register)</h4>
+<p>Writing bit <em>n</em> sets pin <em>n</em>; writing bit <em>n</em>+16 clears it. A single atomic write changes only the pins you name — no read-modify-write, no race. <em>(Module 04)</em></p>
+
+<h4>Alternate Function (AF)</h4>
+<p>A pin mode (CNF = AF push-pull/open-drain) that hands the pin to a peripheral such as a USART, timer, I²C or SPI instead of plain GPIO. e.g. PA9 as USART1 TX. <em>(Modules 06+)</em></p>
+
+<!-- ===================== UART ===================== -->
+<span class="section-tag">UART / Serial</span>
+<h2>Serial communication</h2>
+
+<h4>USART / UART</h4>
+<p>(Universal Synchronous/Asynchronous Receiver-Transmitter.) The STM32 serial peripheral. In asynchronous (UART) mode it frames bytes with start/stop bits at an agreed baud rate. USART1 base <code>0x40013800</code>. <em>(Modules 06–07)</em></p>
+
+<h4>Baud rate / BRR</h4>
+<p>The bit rate of the serial line. The Baud Rate Register encodes <code>f<sub>ck</sub> / (16 × baud)</code>. For 8 MHz / 9600 baud, <code>BRR = 0x0341</code>. <em>(Module 06)</em></p>
+
+<h4>TXE / TC / RXNE</h4>
+<p>USART status flags: <strong>TXE</strong> = transmit data register empty (ok to write the next byte); <strong>TC</strong> = transmission complete (last bit shifted out); <strong>RXNE</strong> = receive data register not empty (a byte arrived). <em>(Modules 06–07)</em></p>
+
+<h4>Retargeting <code>printf</code></h4>
+<p>Redirecting the C library's output to your hardware by implementing the low-level <code>_write()</code> syscall so it sends characters to the UART. With unbuffered <code>stdout</code> this needs no heap. <em>(Module 06)</em></p>
+
+<h4>Semihosting</h4>
+<p>A debug mechanism where the target asks the host/debugger to perform I/O (e.g. console output) via a special breakpoint. An alternative to UART for seeing output; this course uses UART because it works cleanly under QEMU's serial routing. <em>(Module 06)</em></p>
+
+<!-- ===================== TIMERS / IRQ ===================== -->
+<span class="section-tag">Timers &amp; Interrupts</span>
+<h2>Time and events</h2>
+
+<h4>SysTick</h4>
+<p>A simple 24-bit down-counter built into every Cortex-M core (at <code>0xE000E010</code>), commonly used for a periodic millisecond tick. Registers: CSR (control), RVR (reload), CVR (current). <em>(Module 08)</em></p>
+
+<h4>Prescaler (PSC) / Auto-reload (ARR)</h4>
+<p>In a general-purpose timer, <code>PSC</code> divides the input clock (by PSC+1) to set the counting rate, and <code>ARR</code> sets the count at which the timer wraps and raises an update event. <em>(Module 09)</em></p>
+
+<h4>Output Compare / PWM</h4>
+<p>A timer mode that toggles or drives a pin when the counter matches a compare value (CCRx) — used to generate PWM (variable duty-cycle) signals. <em>(Module 09)</em></p>
+
+<h4>Input Capture</h4>
+<p>A timer mode that latches the counter value into CCRx on an input edge — used to measure pulse widths or signal frequency. <em>(Module 09)</em></p>
+
+<h4>Exception / Interrupt (IRQ)</h4>
+<p>An event that diverts the CPU to a handler via the vector table. System exceptions (Reset, HardFault, SysTick…) have fixed slots; peripheral interrupts (IRQs) are numbered per RM0041 Table 51. <em>(Module 10)</em></p>
+
+<h4>NVIC (Nested Vectored Interrupt Controller)</h4>
+<p>The Cortex-M unit that enables/prioritises interrupts. You enable IRQ <em>n</em> by writing bit <em>n</em>%32 of <code>NVIC_ISER[n/32]</code> (base <code>0xE000E100</code>). It also handles nesting and automatic context save/restore. <em>(Module 10)</em></p>
+
+<h4>EXTI (External Interrupt/Event Controller)</h4>
+<p>Routes GPIO pin edges (and a few internal sources) to NVIC interrupt lines, with rising/falling edge selection and a pending-bit you clear in the handler. <em>(Module 10)</em></p>
+
+<!-- ===================== DMA / BUSES ===================== -->
+<span class="section-tag">DMA &amp; Serial Buses</span>
+<h2>Data movement &amp; device buses</h2>
+
+<h4>DMA (Direct Memory Access)</h4>
+<p>A controller that moves data between memory and peripherals without CPU involvement, freeing the core. On the F100, DMA1 has 7 channels; USART1-TX uses channel 4. Base <code>0x40020000</code>. <em>(Module 11)</em></p>
+
+<h4>I²C (Inter-Integrated Circuit)</h4>
+<p>A two-wire (SCL clock, SDA data) multi-drop bus where a master addresses 7-bit slave devices with ACK/NACK handshaking and START/STOP conditions. <em>(Module 12)</em></p>
+
+<h4>SPI (Serial Peripheral Interface)</h4>
+<p>A four-wire full-duplex bus (SCK, MOSI, MISO, chip-select) with no addressing; the master clocks data out and in simultaneously. Clock polarity/phase are set by CPOL/CPHA. <em>(Module 13)</em></p>
+
+<h4>APB1 / APB2 / AHB</h4>
+<p>The internal peripheral buses. AHB is the fast bus (DMA, the core's GPIO clock tree gating); APB2 hosts higher-speed peripherals (GPIO, USART1, SPI1, TIM1); APB1 hosts the rest (USART2/3, I²C, SPI2, TIM2/3/4). Which bus a peripheral is on determines which RCC <code>…ENR</code> register enables it. <em>(Modules 03+)</em></p>
+
+<!-- ===================== TOOLING ===================== -->
+<span class="section-tag">Toolchain &amp; QEMU</span>
+<h2>Building &amp; running</h2>
+
+<h4><code>arm-none-eabi-gcc</code></h4>
+<p>The bare-metal ("none" OS, EABI) ARM cross-compiler used to build all firmware. Companion tools: <code>objdump</code> (disassemble), <code>objcopy</code> (make a raw binary), <code>readelf</code> (inspect sections), <code>size</code>. <em>(Modules 01–02, all builds)</em></p>
+
+<h4>newlib / nano.specs</h4>
+<p>The small C library used for embedded targets; <code>--specs=nano.specs</code> selects the size-optimised variant (integer-only <code>printf</code>). <code>--specs=nosys.specs</code> supplies stub OS syscalls you can override. <em>(Module 06)</em></p>
+
+<h4>QEMU <code>-M stm32vldiscovery</code></h4>
+<p>The QEMU machine that emulates this board's Cortex-M3 and USARTs. It does <strong>not</strong> model GPIO, timers, DMA or I²C — see the emulation table in the <a href="README.md">README</a>. <em>(All modules)</em></p>
+
+<h4>The 3-serial routing rule</h4>
+<p>Because the machine has three USARTs, QEMU needs a backend for each. Run with
+<code>-serial stdio -serial null -serial null</code> so USART1 reaches your terminal;
+a bare <code>-serial stdio</code> errors out. <em>(Module 06)</em></p>
+
+<hr>
+<p class="muted">Return to the <a href="README.md">course home</a> or jump to <a href="01-arm-architecture/01-arm-architecture.html">Module 01</a>.</p>
+
+</div>
+</body>
+</html>

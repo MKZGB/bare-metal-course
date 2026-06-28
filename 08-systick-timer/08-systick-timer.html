@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>08 · SysTick Timer — Bare-Metal STM32</title>
+<link rel="stylesheet" href="../common/style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <a href="../README.md">Home</a>
+  <a href="../glossary.html">Glossary</a>
+  <a href="../07-uart-receive/07-uart-receive.html">‹ Prev</a>
+  <a href="../09-general-purpose-timers/09-general-purpose-timers.html">Next ›</a>
+  <a href="08-systick-timer-pt.html">🌐 Português</a>
+  <span class="spacer"></span>
+  <span class="badge">STM32F100RBT6 · PM0056</span>
+</nav>
+
+<div class="wrap">
+
+<h1><span class="modnum">Module 08</span> SysTick Timer — An Accurate Millisecond Tick</h1>
+<p class="subtitle">Use the Cortex-M3 core <code>SysTick</code> timer to build a real <code>delay_ms()</code> and a millisecond uptime clock, then print an incrementing counter once per second over UART.</p>
+
+<div class="box note">
+  <span class="box-title">Dependencies</span>
+  This module reuses the UART transmit + <code>printf</code> retarget from <a href="../06-uart-transmit/06-uart-transmit.html">Module 06</a>. Interrupts are introduced informally here (the SysTick exception); <a href="../10-interrupts-nvic/10-interrupts-nvic.html">Module 10</a> covers the NVIC in full. You should already be comfortable with <code>volatile</code> register access from Modules 03–04.
+</div>
+
+<div class="box ok">
+  <span class="box-title">This one is fully visible in QEMU</span>
+  Unlike GPIO and the general-purpose timers, <code>SysTick</code> is a <em>core</em> peripheral of the Cortex-M3 and QEMU emulates it <strong>completely</strong> — it counts, sets <code>COUNTFLAG</code>, and fires the <code>SysTick</code> exception. Combined with the (also fully-emulated) USART1, you will watch real, increasing uptime values scroll up your terminal.
+</div>
+
+<!-- ============================== THEORY ============================== -->
+<span class="section-tag">Theory</span>
+<h2>1. What SysTick is for</h2>
+
+<p>Module 04 used a <code>for</code>-loop busy-wait for timing — simple, but the duration depends on the compiler, optimisation level, and clock speed. It is unmeasured guesswork. Almost every embedded system instead wants a <strong>known, periodic tick</strong>: a heartbeat that fires every <em>N</em> milliseconds so software can schedule work, time out operations, and measure elapsed time.</p>
+
+<p>The Cortex-M3 builds one in. <strong>SysTick</strong> is a 24-bit down-counter that lives inside the CPU core (not on a peripheral bus), so it exists on <em>every</em> Cortex-M3 regardless of vendor. It counts down from a reload value to 0, optionally raises the <code>SysTick</code> exception when it hits 0, then automatically reloads and continues. It was designed precisely to drive an RTOS tick — but it works just as well bare-metal.</p>
+
+<h3>1.1 The four registers (PM0056, @ <code>0xE000E010</code>)</h3>
+
+<table>
+  <tr><th>Register</th><th>Address</th><th>Purpose</th></tr>
+  <tr><td><code>SYST_CSR</code></td><td><code>0xE000E010</code></td><td>Control &amp; status</td></tr>
+  <tr><td><code>SYST_RVR</code></td><td><code>0xE000E014</code></td><td>Reload value (24-bit)</td></tr>
+  <tr><td><code>SYST_CVR</code></td><td><code>0xE000E018</code></td><td>Current value (write clears)</td></tr>
+  <tr><td><code>SYST_CALIB</code></td><td><code>0xE000E01C</code></td><td>Calibration (unused here)</td></tr>
+</table>
+
+<h3>1.2 The control/status register, <code>SYST_CSR</code></h3>
+
+<table>
+  <tr><th>Bit</th><th>Name</th><th>Meaning</th></tr>
+  <tr><td>0</td><td><code>ENABLE</code></td><td>1 = counter is running.</td></tr>
+  <tr><td>1</td><td><code>TICKINT</code></td><td>1 = assert the <code>SysTick</code> exception each time the counter reaches 0.</td></tr>
+  <tr><td>2</td><td><code>CLKSOURCE</code></td><td>Clock select: <strong>1 = processor clock (HCLK)</strong>, 0 = external reference clock.</td></tr>
+  <tr><td>16</td><td><code>COUNTFLAG</code></td><td>Reads 1 if the counter reached 0 since this register was last read. <strong>Reading <code>CSR</code> clears it.</strong></td></tr>
+</table>
+
+<h3>1.3 The reload value, <code>SYST_RVR</code></h3>
+<p>When the counter reaches 0, the hardware loads it with <code>SYST_RVR</code> on the next clock and keeps counting. To get a period of <em>N</em> input-clock ticks you write <strong><code>RVR = N − 1</code></strong> (the counter visits <em>N</em> states: <code>N−1, N−2, … 1, 0</code>).</p>
+
+<div class="box note">
+  <span class="box-title">The 1 ms reload calculation</span>
+  After reset the chip runs on the internal HSI oscillator at <strong>8 MHz</strong> (RM0041 §7), and with <code>CLKSOURCE=1</code> SysTick is fed by that 8 MHz processor clock. One millisecond is 8&nbsp;000 clock ticks, so:
+  <div class="diagram">RVR = (8 000 000 Hz / 1000 Hz) − 1 = 8000 − 1 = <strong>7999</strong></div>
+  This is the only number you must compute in this module.
+</div>
+
+<h3>1.4 The current value, <code>SYST_CVR</code></h3>
+<p>Reading <code>CVR</code> returns the live counter. <em>Writing</em> any value to it clears the counter to 0 and also clears <code>COUNTFLAG</code>; the data you wrote is ignored. You write it once during setup so the first full period starts cleanly from the reload value.</p>
+
+<div class="box danger">
+  <span class="box-title">⚠ 24-bit counter — maximum reload</span>
+  <code>RVR</code> and <code>CVR</code> are only <strong>24 bits</strong> wide. The largest reload is <code>0xFFFFFF = 16 777 215</code>. At 8 MHz that is the longest single SysTick period possible — about <code>16 777 216 / 8 000 000 ≈ 2.097 s</code>. For longer intervals you count multiple ticks in software (which is exactly what our 1-second uptime does: 1000 × 1 ms ticks).
+</div>
+
+<h2>2. Two ways to use it</h2>
+
+<h3>2.1 Style A — polling <code>COUNTFLAG</code> (blocking)</h3>
+<p>For a one-shot blocking delay you can leave <code>TICKINT</code> off and simply poll <code>COUNTFLAG</code> in a loop. Each time it reads 1, one full reload period has elapsed:</p>
+<pre><code>/* blocking delay of 'ticks' periods, no interrupt */
+SYST_RVR = 7999U;                       /* 1 ms period            */
+SYST_CVR = 0U;                          /* clear                  */
+SYST_CSR = CSR_CLKSOURCE | CSR_ENABLE;  /* run, NO TICKINT        */
+while (ticks &gt; 0U) {
+    while ((SYST_CSR &amp; CSR_COUNTFLAG) == 0U) { /* wait one period */ }
+    ticks--;                             /* the read above cleared COUNTFLAG */
+}</code></pre>
+<p>Simple, but the CPU is stuck spinning and cannot do anything else.</p>
+
+<h3>2.2 Style B — interrupt-driven (a free-running clock)</h3>
+<p>Set <code>TICKINT=1</code> and the timer raises the <code>SysTick</code> exception every period. A tiny handler increments a counter, and the rest of your program reads that counter whenever it wants the time. This is what we build in the exercise — it gives a continuously running millisecond clock that costs almost nothing.</p>
+
+<div class="box note">
+  <span class="box-title">No NVIC line to enable</span>
+  <code>SysTick</code> is a Cortex-M3 <em>system exception</em> (vector position 15), not an external IRQ, so you do <strong>not</strong> touch the NVIC <code>ISER</code> registers to enable it — the <code>TICKINT</code> bit is its enable. The handler name is <code>SysTick_Handler</code>, which is already a <code>WEAK</code> symbol in <code>common/startup.c</code>; defining a function with that exact name overrides it.
+</div>
+
+<h3>2.3 Why the counter must be <code>volatile</code></h3>
+<p>The tick counter is written by the interrupt handler and read by <code>main()</code>. From <code>main()</code>'s point of view, nothing in its own straight-line code ever changes that variable — so an optimising compiler is entitled to read it <em>once</em> into a CPU register and reuse that cached copy. A delay loop built on a cached value would never see the handler's updates and would <strong>spin forever</strong>. Declaring it <code>volatile uint32_t</code> tells the compiler "this can change behind your back — re-read it from memory every single time." This is the canonical use of <code>volatile</code>: a variable shared between an ISR and mainline code.</p>
+
+<!-- ============================== EXERCISE ============================== -->
+<span class="section-tag">Guided Exercise</span>
+<h2>3. A millisecond clock that prints uptime</h2>
+
+<p><strong>Goal:</strong> drive a 1 ms SysTick interrupt that increments a global tick count, implement <code>delay_ms()</code> on top of it, and have <code>main()</code> print <code>"Uptime: N s"</code> once per second over USART1. You will:</p>
+<ol>
+  <li>Initialise USART1 + <code>printf</code> retarget (carried over from Module 06).</li>
+  <li>Compute the 1 ms reload value and program <code>RVR</code>/<code>CVR</code>/<code>CSR</code>.</li>
+  <li>Write <code>SysTick_Handler</code> to increment a <code>volatile</code> counter.</li>
+  <li>Write <code>delay_ms()</code> that waits for the counter to advance.</li>
+</ol>
+
+<h3>3.1 Skeleton — create <code>08-systick-timer/main.c</code></h3>
+<p>Fill in every <code>TODO</code>. The UART helpers are given complete so you can focus on SysTick.</p>
+
+<pre><code>#include &lt;stdint.h&gt;
+#include &lt;stdio.h&gt;
+
+/* ---- SysTick registers (Cortex-M3 core, PM0056) ------------------- */
+#define SYST_CSR   (*(volatile uint32_t *)0xE000E010U)
+#define SYST_RVR   (*(volatile uint32_t *)0xE000E014U)
+#define SYST_CVR   (*(volatile uint32_t *)0xE000E018U)
+
+#define CSR_ENABLE     (1U &lt;&lt; 0)
+#define CSR_TICKINT    (1U &lt;&lt; 1)
+#define CSR_CLKSOURCE  (1U &lt;&lt; 2)
+#define CSR_COUNTFLAG  (1U &lt;&lt; 16)
+
+/* ---- USART1 (given: see Module 06) -------------------------------- */
+#define RCC_APB2ENR  (*(volatile uint32_t *)0x40021018U)
+#define GPIOA_CRH    (*(volatile uint32_t *)0x40010804U)
+#define USART1_SR    (*(volatile uint32_t *)0x40013800U)
+#define USART1_DR    (*(volatile uint32_t *)0x40013804U)
+#define USART1_BRR   (*(volatile uint32_t *)0x40013808U)
+#define USART1_CR1   (*(volatile uint32_t *)0x4001380CU)
+#define USART_SR_TXE (1U &lt;&lt; 7)
+
+/* The tick counter, shared between the ISR and main().
+ * TODO 1: what qualifier MUST this have, and why? Add it. */
+static /* ??? */ uint32_t g_msticks = 0U;
+
+/* ---- SysTick exception handler ------------------------------------ */
+void SysTick_Handler(void)
+{
+    /* TODO 2: advance the millisecond tick count by one. */
+}
+
+static void systick_init(uint32_t reload)
+{
+    /* TODO 3: program the 24-bit reload value (RVR). */
+    /* TODO 4: clear the current value (CVR) so the first period is clean. */
+    /* TODO 5: enable the counter with: processor clock + interrupt + run.
+     *         (which three CSR bits?) */
+}
+
+static void delay_ms(uint32_t ms)
+{
+    /* TODO 6: snapshot g_msticks, then spin until it has advanced by 'ms'.
+     *         Using unsigned subtraction handles counter wrap correctly. */
+}
+
+/* ---- UART + printf retarget (given complete) ---------------------- */
+static void uart_init(void)
+{
+    RCC_APB2ENR |= (1U &lt;&lt; 2) | (1U &lt;&lt; 14);            /* IOPAEN | USART1EN  */
+    GPIOA_CRH = (GPIOA_CRH &amp; ~(0xFU &lt;&lt; 4)) | (0xBU &lt;&lt; 4); /* PA9 AF PP 50MHz */
+    USART1_BRR = 0x0341U;                            /* 9600 @ 8 MHz      */
+    USART1_CR1 = (1U &lt;&lt; 3) | (1U &lt;&lt; 13);              /* TE | UE           */
+}
+static void uart_putc(char c)
+{
+    while ((USART1_SR &amp; USART_SR_TXE) == 0U) { }
+    USART1_DR = (uint32_t)((uint8_t)c);
+}
+int _write(int fd, const char *buf, int len)
+{
+    int i; (void)fd;
+    for (i = 0; i &lt; len; i++) {
+        if (buf[i] == '\n') { uart_putc('\r'); }
+        uart_putc(buf[i]);
+    }
+    return len;
+}
+
+int main(void)
+{
+    uint32_t seconds = 0U;
+
+    uart_init();
+    setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered: no heap needed */
+
+    /* TODO 7: what reload value gives a 1 ms tick at 8 MHz? Pass it in. */
+    systick_init(/* ??? */);
+
+    for (;;)
+    {
+        delay_ms(1000U);
+        seconds++;
+        printf("Uptime: %u s\n", (unsigned)seconds);
+    }
+    return 0;
+}
+</code></pre>
+
+<h3>3.2 Build &amp; run</h3>
+<p>From inside the <code>08-systick-timer/</code> folder:</p>
+<pre><code>make -f ../common/Makefile SRC=main.c run</code></pre>
+<p>You should see, once per second:</p>
+<pre><code>Uptime: 1 s
+Uptime: 2 s
+Uptime: 3 s
+...</code></pre>
+<p>Quit QEMU with <kbd>Ctrl-A</kbd> then <kbd>X</kbd>. Success criterion: the counter prints increasing values, roughly one per real second.</p>
+
+<h3>3.3 Hints</h3>
+<details class="hint">
+  <summary>Hint 1 — the reload value and CSR enable</summary>
+  <p>1 ms at 8 MHz is 8000 input clocks, so <code>RVR = 8000 − 1 = 7999</code>. Enable with all three bits at once: <code>SYST_CSR = CSR_CLKSOURCE | CSR_TICKINT | CSR_ENABLE;</code> (processor clock, raise the exception on zero, and run).</p>
+</details>
+<details class="hint">
+  <summary>Hint 2 — the handler and the volatile counter</summary>
+  <p><code>g_msticks</code> must be <code>static volatile uint32_t</code>. The handler body is one line: <code>g_msticks++;</code>. Entering the exception acknowledges it automatically — you do not need to read/clear <code>COUNTFLAG</code> in interrupt mode.</p>
+</details>
+<details class="hint">
+  <summary>Hint 3 — implementing delay_ms()</summary>
+  <p>Snapshot the start, then loop on the difference:</p>
+  <pre><code>uint32_t start = g_msticks;
+while ((g_msticks - start) &lt; ms) { /* spin */ }</code></pre>
+  <p>Unsigned subtraction means the test stays correct even when <code>g_msticks</code> wraps past <code>0xFFFFFFFF</code>. Because <code>g_msticks</code> is <code>volatile</code>, each loop iteration re-reads it from memory.</p>
+</details>
+<details class="hint">
+  <summary>Hint 4 — clearing CVR</summary>
+  <p>Any write clears it; the value is ignored. Just do <code>SYST_CVR = 0U;</code> before enabling, so the first measured period is a full reload rather than whatever junk was in the counter at reset.</p>
+</details>
+
+<div class="box ok">
+  <span class="box-title">Reference solution</span>
+  Full, commented solution: <code>solutions/08-systick-timer.c</code>. Try every hint first.
+</div>
+
+<!-- ============================== QUESTIONS ============================== -->
+<span class="section-tag">Verification Questions</span>
+<h2>4. Check your understanding</h2>
+
+<details class="answer">
+  <summary>Q1. Why is the reload value 7999 and not 8000 for a 1 ms tick at 8 MHz?</summary>
+  <p>The counter counts down through every value from the reload to 0 inclusive, which is <em>reload + 1</em> states. To span exactly 8000 clock ticks (1 ms at 8 MHz) you need 8000 states, so <code>RVR = 8000 − 1 = 7999</code>. Writing 8000 would give a period of 8001 ticks — off by one.</p>
+</details>
+<details class="answer">
+  <summary>Q2. Why must the tick counter be declared <code>volatile</code>?</summary>
+  <p>It is written by the <code>SysTick_Handler</code> ISR and read by <code>main()</code>. The compiler cannot see that the ISR runs, so without <code>volatile</code> it may cache the variable in a register and reuse the stale value — making <code>delay_ms()</code> spin forever. <code>volatile</code> forces a fresh memory read on every access, which is exactly what a variable shared between an interrupt and mainline code requires.</p>
+</details>
+<details class="answer">
+  <summary>Q3. When would you poll <code>COUNTFLAG</code> instead of using the interrupt?</summary>
+  <p>Polling (Style A) suits a simple one-shot blocking delay when the CPU has nothing else to do and you want no ISR. The interrupt (Style B) is better for a free-running clock: the timer maintains the tick count in the background while <code>main()</code> does other work and merely reads the count when needed. Note that reading <code>CSR</code> clears <code>COUNTFLAG</code>, so a polling loop consumes the flag each time it observes it.</p>
+</details>
+<details class="answer">
+  <summary>Q4. What does the <code>CLKSOURCE</code> bit select, and what do we use?</summary>
+  <p><code>CLKSOURCE</code> chooses the SysTick input clock: <strong>1 = the processor clock (HCLK)</strong>, 0 = an external reference clock (an implementation-defined, typically slower, divided clock). We set it to 1 so SysTick is driven by the full 8 MHz HSI processor clock, which is what the 7999 reload calculation assumes.</p>
+</details>
+<details class="answer">
+  <summary>Q5. What is the longest single period SysTick can produce at 8 MHz, and why?</summary>
+  <p><code>RVR</code>/<code>CVR</code> are 24-bit, so the maximum reload is <code>0xFFFFFF = 16 777 215</code>, giving 16 777 216 clock ticks per period. At 8 MHz that is about <code>16 777 216 / 8 000 000 ≈ 2.10 s</code>. For longer intervals (like our 1 second built from 1000 × 1 ms) you accumulate multiple short ticks in software rather than asking for one huge period.</p>
+</details>
+<details class="answer">
+  <summary>Q6. Do you need to enable a SysTick IRQ in the NVIC?</summary>
+  <p>No. SysTick is a Cortex-M3 <em>system exception</em> (vector slot 15), not one of the peripheral IRQ lines. Its enable is the <code>TICKINT</code> bit in <code>SYST_CSR</code>; the NVIC <code>ISER</code> registers only control external IRQs (covered in Module 10). Setting <code>TICKINT|ENABLE</code> is all that is needed to start getting <code>SysTick_Handler</code> calls.</p>
+</details>
+
+<div class="modfooter">
+  <a href="../07-uart-receive/07-uart-receive.html">← 07 · UART Receive</a>
+  <a href="../09-general-purpose-timers/09-general-purpose-timers.html">09 · General-Purpose Timers →</a>
+</div>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · ARM Design Philosophy &amp; RISC — Bare-Metal STM32</title>
+<link rel="stylesheet" href="../common/style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <a href="../README.md">Home</a>
+  <a href="../glossary.html">Glossary</a>
+  <a href="../README.md">Home</a>
+  <a href="../02-arm-programmer-model/02-arm-programmer-model.html">Next ›</a>
+  <a href="01-arm-architecture-pt.html">🌐 Português</a>
+  <span class="spacer"></span>
+  <span class="badge">STM32F100RBT6 · RM0041</span>
+</nav>
+
+<div class="wrap">
+
+<h1><span class="modnum">Module 01</span> ARM Design Philosophy &amp; RISC Architecture</h1>
+<p class="subtitle">Before writing a single register access, understand <em>what kind of machine</em> the STM32F100 is: a load-store RISC core (Cortex-M3) that processes data only in registers, executes one fixed-format instruction set (Thumb-2), and maps every peripheral into a single address space.</p>
+
+<div class="box note">
+  <span class="box-title">Where this module fits</span>
+  This is the first module of the course and has <strong>no firmware to flash</strong> — it is pure architecture theory plus one hands-on disassembly exercise. You already know C and generic CPU concepts (registers, ALU, memory). The goal here is to map that knowledge onto ARM so that everything from <a href="../02-arm-programmer-model/02-arm-programmer-model.html">Module 02</a> onward makes sense. There is no QEMU step and no solution file.
+</div>
+
+<!-- ============================== THEORY ============================== -->
+<span class="section-tag">Theory</span>
+<h2>1. RISC vs CISC</h2>
+
+<p>Two broad philosophies have shaped CPU instruction sets:</p>
+
+<table>
+  <tr><th></th><th>CISC (e.g. x86)</th><th>RISC (e.g. ARM)</th></tr>
+  <tr><td><strong>Instruction count</strong></td><td>Many, often hundreds, some very specialized</td><td>Few, simple, general-purpose</td></tr>
+  <tr><td><strong>Instruction length</strong></td><td>Variable (1–15 bytes on x86)</td><td>Fixed or near-fixed (2 or 4 bytes on Cortex-M)</td></tr>
+  <tr><td><strong>Memory operands</strong></td><td>Most instructions can read/write memory directly (<code>add [mem], reg</code>)</td><td>Only dedicated load/store instructions touch memory</td></tr>
+  <tr><td><strong>Registers</strong></td><td>Few architectural registers (historically 8 on x86)</td><td>Large, uniform register file (16 on ARM)</td></tr>
+  <tr><td><strong>Decode</strong></td><td>Complex; one instruction may be microcoded into many steps</td><td>Simple; one instruction ≈ one fixed pipeline path</td></tr>
+</table>
+
+<p>The RISC bet is: keep each instruction <em>simple and predictable</em> so the hardware decoding it can be small and fast, then let the compiler stitch those simple instructions together. A small, regular decoder uses less silicon and less power — which is exactly what a microcontroller wants. The name says it: <strong>Reduced Instruction Set Computer</strong>. "Reduced" means each instruction does <em>less</em>, not that there are necessarily fewer of them.</p>
+
+<div class="box note">
+  <span class="box-title">Not a religious war</span>
+  Modern high-end x86 chips internally crack CISC instructions into RISC-like "micro-ops", and ARM has plenty of instructions. The labels describe the <em>visible instruction-set design</em>, not a hard line in silicon. For a microcontroller like the STM32F100, the RISC traits below are what actually matter to you as a bare-metal programmer.</p>
+</div>
+
+<h2>2. The load-store architecture</h2>
+
+<p>This is the single most important RISC trait for understanding ARM assembly. On a load-store machine:</p>
+
+<ul>
+  <li><strong>Arithmetic and logic operate <em>only</em> on registers</strong> (and small immediates). <code>add r0, r1, r2</code> means <code>r0 = r1 + r2</code> — all three are CPU registers.</li>
+  <li><strong>Memory is touched <em>only</em> by explicit load and store instructions:</strong> <code>ldr</code> (LoaD Register, memory → register) and <code>str</code> (STore Register, register → memory).</li>
+</ul>
+
+<p>So the universal pattern for "do something with a value in memory" is always three phases:</p>
+
+<div class="diagram">load-store cycle (the rhythm of every ARM program)
+
+   MEMORY                         REGISTER FILE (r0..r12)
+   +-----------+                  +------------------+
+   | array[0]  |  --- ldr --->    | r3 = array[0]    |   (1) LOAD
+   | array[1]  |  --- ldr --->    | r2 = array[1]    |
+   +-----------+                  |                  |
+                                  | add r3, r3, r2   |   (2) COMPUTE
+                                  |   (r3 = r3 + r2) |       (registers only)
+   +-----------+                  |                  |
+   | result    |  &lt;--- str ---    | r3               |   (3) STORE
+   +-----------+                  +------------------+</div>
+
+<p>Contrast with a CISC machine where <code>add result, array[1]</code> could fold the load, the add, and the store into one instruction. ARM forbids that. It feels verbose, but it makes every instruction's timing and memory behavior <em>predictable</em>, which is gold for real-time embedded code.</p>
+
+<div class="box ok">
+  <span class="box-title">Why you care as a firmware author</span>
+  When you write <code>GPIOC_BSRR = (1U &lt;&lt; 9);</code> later in the course, the compiler <em>must</em> emit: load the address of BSRR into a register, load/compute the value into another register, then <code>str</code> the value to that address. Memory-mapped peripheral access is just the load-store pattern pointed at a hardware register instead of RAM. Understanding this is why <code>volatile</code> matters — it tells the compiler "do not optimize away these loads and stores."
+</div>
+
+<h2>3. Fixed-size instruction encoding &amp; the register file</h2>
+
+<h3>3.1 Fixed-size encoding</h3>
+<p>On classic 32-bit ARM, <em>every</em> instruction is exactly 4 bytes. This makes the fetch/decode logic trivial — the CPU always knows where the next instruction begins. (Cortex-M complicates this slightly with Thumb-2, covered in §4: instructions are 2 <em>or</em> 4 bytes, but still drawn from a small, regular set.) Compare to x86 where an instruction can be anywhere from 1 to 15 bytes and the decoder must partly execute one instruction to find where the next starts.</p>
+
+<h3>3.2 A large, uniform register file</h3>
+<p>The ARM (and Cortex-M3) integer register file has <strong>16 registers, <code>r0</code>–<code>r15</code>, each 32 bits wide</strong>. Most are general-purpose; a few have special roles by convention or hardware:</p>
+
+<table>
+  <tr><th>Register</th><th>Role</th></tr>
+  <tr><td><code>r0</code>–<code>r12</code></td><td>General-purpose (arguments, locals, scratch)</td></tr>
+  <tr><td><code>r13</code> (<code>sp</code>)</td><td>Stack Pointer</td></tr>
+  <tr><td><code>r14</code> (<code>lr</code>)</td><td>Link Register (return address)</td></tr>
+  <tr><td><code>r15</code> (<code>pc</code>)</td><td>Program Counter</td></tr>
+</table>
+
+<p>Having many registers means the compiler can keep more values "in hand" without spilling them to memory, which directly reduces the number of slow <code>ldr</code>/<code>str</code> operations. We dissect these registers in detail in <a href="../02-arm-programmer-model/02-arm-programmer-model.html">Module 02 (Programmer's Model)</a>.</p>
+
+<h3>3.3 Pipelining — the Cortex-M3 has 3 stages</h3>
+<p>Because instructions are simple and regular, ARM cores overlap their execution in a <strong>pipeline</strong>. The Cortex-M3 uses a classic <strong>3-stage pipeline</strong>:</p>
+
+<div class="diagram">Cortex-M3 3-stage pipeline (one instruction finishes ~every cycle)
+
+  cycle:      1        2        3        4        5
+  instr A: [FETCH] [DECODE] [EXECUTE]
+  instr B:          [FETCH] [DECODE] [EXECUTE]
+  instr C:                   [FETCH] [DECODE] [EXECUTE]
+
+  FETCH   = read instruction from Flash
+  DECODE  = work out what it does, read register operands
+  EXECUTE = run it through the ALU / load-store unit</div>
+
+<p>One consequence you will meet in <a href="../02-arm-programmer-model/02-arm-programmer-model.html">Module 02</a>: because the PC is read in the fetch stage, the value of <code>pc</code> visible to an executing instruction is <em>ahead</em> of that instruction's own address. Simple, fixed-format instructions are what make a clean pipeline like this cheap to build — another payoff of the RISC design.</p>
+
+<h2>4. ARM, Thumb, and Thumb-2 instruction sets</h2>
+
+<p>"ARM" the company has shipped several encodings of its instruction set over time:</p>
+
+<table>
+  <tr><th>Instruction set</th><th>Width</th><th>Idea</th></tr>
+  <tr><td><strong>ARM</strong></td><td>32-bit fixed</td><td>The original. Maximum capability per instruction, but every instruction costs 4 bytes of program memory.</td></tr>
+  <tr><td><strong>Thumb</strong> (Thumb-1)</td><td>16-bit fixed</td><td>A compressed subset: the most common operations re-encoded into 2 bytes each for much better <em>code density</em>, at the cost of needing more instructions for some tasks.</td></tr>
+  <tr><td><strong>Thumb-2</strong></td><td>mixed 16- &amp; 32-bit</td><td>The best of both: keep the dense 16-bit forms for common ops, add 32-bit forms for everything else, all in <em>one</em> seamlessly interleaved instruction stream.</td></tr>
+</table>
+
+<h3>4.1 Why Cortex-M runs Thumb-2 <em>only</em></h3>
+<p>Microcontrollers are dominated by <strong>code density</strong>: the STM32F100RBT6 has just <strong>128&nbsp;KB of Flash</strong>. Every byte of program counts. Thumb-2 gives near-ARM performance while packing code tightly, so the entire Cortex-M family dropped the legacy 32-bit ARM state entirely and executes Thumb-2 exclusively. There is no mode switch to worry about, no interworking — the core is always in Thumb state.</p>
+
+<div class="box warn">
+  <span class="box-title">Practical consequence for the toolchain</span>
+  This is why every compile command in this course passes <code>-mthumb</code> (and <code>-mcpu=cortex-m3</code>). You are telling GCC: emit Thumb-2 code for an ARMv7-M core. Hand it ARM (32-bit) code and the Cortex-M3 would fault — it cannot decode the old encoding. It is also why function pointers on Cortex-M have bit&nbsp;0 set to&nbsp;1 (the "Thumb bit"); you will see this when we set up the vector table.
+</div>
+
+<h2>5. Where the STM32F100 sits</h2>
+
+<p>Putting names to layers, from the abstract ISA down to the chip on your board:</p>
+
+<div class="diagram">From architecture to silicon
+
+  ARMv7-M          <- the ARCHITECTURE (the contract: what instructions
+                      and registers exist, the memory model)
+     |
+  Cortex-M3        <- the CORE: ARM's specific implementation of ARMv7-M
+                      (3-stage pipeline, NVIC, SysTick, Thumb-2 only)
+     |
+  STM32F100RBT6    <- the CHIP: ST wraps a Cortex-M3 core with Flash,
+                      SRAM, and peripherals (GPIO, USART, timers...)
+     |
+  STM32VLDISCOVERY <- the BOARD: the chip + LEDs, button, debugger</div>
+
+<p>Key architectural facts about this core that shape everything you write:</p>
+
+<table>
+  <tr><th>Property</th><th>Value</th><th>Why it matters to you</th></tr>
+  <tr><td>Core</td><td>ARM Cortex-M3</td><td>Implements the ARMv7-M architecture.</td></tr>
+  <tr><td>Word size</td><td>32-bit</td><td>Registers, addresses, and the native <code>int</code> are all 32 bits.</td></tr>
+  <tr><td>Endianness</td><td>Little-endian</td><td>The least-significant byte of a word sits at the lowest address. Matters when you cast pointers or pack bytes.</td></tr>
+  <tr><td>Bus structure</td><td>Harvard-style</td><td>Separate buses for fetching instructions (Flash) and accessing data (SRAM/peripherals), so a fetch and a data access can happen at once.</td></tr>
+  <tr><td>Address space</td><td>Single 4&nbsp;GB, memory-mapped</td><td>Flash, SRAM, <em>and every peripheral register</em> live at fixed addresses in one flat 32-bit space. There is no separate "I/O" instruction.</td></tr>
+</table>
+
+<div class="box note">
+  <span class="box-title">"Memory-mapped everything"</span>
+  Because peripherals are just addresses, controlling hardware in C is identical to writing to memory: you make a <code>volatile</code> pointer to the peripheral's address and read/write it. No special instructions, no OS calls. That is the entire premise of bare-metal programming and the subject of <a href="../03-memory-mapped-registers/03-memory-mapped-registers.html">Module 03</a>. The fixed addresses you will use (GPIOC at <code>0x40011000</code>, etc.) come from the reference manual <strong>RM0041</strong>.
+</div>
+
+<h2>6. Why RISC/ARM dominates embedded</h2>
+<ul>
+  <li><strong>Power.</strong> A small, simple decoder and core switch fewer transistors per instruction. For battery and always-on devices this is decisive.</li>
+  <li><strong>Code density (Thumb-2).</strong> More program fits in scarce on-chip Flash, so a cheaper chip with less memory can still do the job.</li>
+  <li><strong>Predictable cycle timing.</strong> Fixed-format, mostly single-purpose instructions and a short, simple pipeline make it far easier to reason about <em>exactly</em> how long a code path takes — essential for hard real-time control.</li>
+  <li><strong>Licensable IP.</strong> ARM sells the core design; vendors like ST add their own peripherals. That ecosystem is why a Cortex-M3 shows up in thousands of different chips.</li>
+</ul>
+
+<!-- ============================== EXERCISE ============================== -->
+<span class="section-tag">Guided Exercise</span>
+<h2>7. See the load-store pattern with your own eyes</h2>
+
+<p><strong>Goal:</strong> compile a tiny C function for Cortex-M3, disassemble the object file, and <em>identify the <code>ldr</code> / <code>str</code> / arithmetic instructions</em> — confirming that ARM computes only in registers and touches memory only via loads and stores.</p>
+
+<div class="box warn">
+  <span class="box-title">Toolchain not required to learn the lesson</span>
+  This exercise uses <code>arm-none-eabi-gcc</code> and <code>arm-none-eabi-objdump</code>. They may not be on your <code>PATH</code> yet — the course README covers installing the <code>gcc-arm-none-eabi</code> toolchain. If you cannot run them right now, that is fine: a real annotated disassembly is printed below in §7.3, and the lesson stands entirely on reading it. There is <strong>no QEMU and no solution file</strong> for this module.
+</div>
+
+<h3>7.1 Skeleton — create <code>01-arm-architecture/example.c</code></h3>
+<p>Write a function that <strong>sums the elements of an <code>int</code> array</strong>. Keep it tiny — we want short, readable assembly, not a clever algorithm. Fill in the <code>TODO</code> yourself before peeking at the hints.</p>
+
+<pre><code>#include &lt;stdint.h&gt;
+
+/* Sum the first `n` elements of `data`.
+ * We want this to disassemble into an obvious load-add-loop so we can
+ * spot the load-store pattern in the machine code. */
+int32_t sum_array(const int32_t *data, uint32_t n)
+{
+    int32_t total = 0;
+
+    /* TODO: loop over the n elements, adding each data[i] to total.
+     *       Use a plain for-loop. Do NOT do anything fancy. */
+
+    return total;
+}
+</code></pre>
+
+<h3>7.2 Compile &amp; disassemble</h3>
+<p>From inside the <code>01-arm-architecture/</code> folder:</p>
+<pre><code># Compile to an object file for the Cortex-M3 in Thumb-2 mode.
+#   -mcpu=cortex-m3  : target this exact core
+#   -mthumb          : emit Thumb-2 (the only state the M3 understands)
+#   -Og              : light optimization -> readable but real code
+#   -c               : compile only, do not link
+arm-none-eabi-gcc -mcpu=cortex-m3 -mthumb -Og -c example.c -o example.o
+
+# Disassemble the machine code back to assembly.
+arm-none-eabi-objdump -d example.o</code></pre>
+
+<p>Read the <code>&lt;sum_array&gt;:</code> section of the output. Look for three things:</p>
+<ol>
+  <li>A <code>ldr</code> that reads an array element from memory into a register.</li>
+  <li>An <code>add</code> that works <em>only</em> on registers (no memory operand in sight).</li>
+  <li>The branch (<code>b</code> / <code>cmp</code>) that forms the loop.</li>
+</ol>
+<p>Notice what is <em>absent</em>: there is no instruction that adds a memory location directly to a register in one step. Every value must be <code>ldr</code>'d in first. That is the load-store architecture, in the metal.</p>
+
+<h3>7.3 Sample disassembly (annotated)</h3>
+<p>Here is representative <code>-Og</code> output for the finished function so the lesson lands even without the toolchain. Exact registers/encodings vary by GCC version, but the <em>shape</em> is always this:</p>
+
+<div class="diagram">00000000 &lt;sum_array&gt;:
+   0:  2300        movs  r3, #0        ; total = 0           (immediate -> register)
+   2:  2200        movs  r2, #0        ; i = 0
+   4:  e004        b.n   10 &lt;.loop_test&gt;
+                                       ; --- loop body ---
+   6:  f850 0022   ldr.w r0, [r0, r2, lsl #2]
+                                       ; LOAD  data[i]  (base r0 + i*4) -> r0
+                                       ; *** memory is read ONLY here ***
+   a:  4403        add   r3, r0        ; total += data[i]   (register + register)
+                                       ; *** arithmetic: registers ONLY ***
+   c:  3201        adds  r2, #1        ; i++                 (register + immediate)
+                                       ; --- loop test ---
+   e:  ...                            ; .loop_test:
+  10:  4291        cmp   r1, r2        ; compare n with i    (registers)
+  12:  d8f8        bhi.n 6             ; if i &lt; n, branch back up to the LOAD
+  14:  4618        mov   r0, r3        ; return value in r0  (ARM calling convention)
+  16:  4770        bx    lr            ; return (branch to Link Register)</div>
+
+<ul>
+  <li><span class="pipeline-step">ldr</span> at <code>0x6</code> is the <em>only</em> instruction reading memory — it pulls <code>data[i]</code> into a register first. The <code>lsl #2</code> is the array index scaled by 4 (the size of an <code>int32_t</code>).</li>
+  <li><span class="pipeline-step">add</span> at <code>0xa</code> sums two <em>registers</em>. The CPU cannot add memory to a register in one instruction — the value had to be loaded first.</li>
+  <li>Instruction widths are mixed: <code>movs</code>/<code>add</code> are 2-byte Thumb forms, <code>ldr.w</code> is a 4-byte Thumb-2 form (the <code>.w</code> = "wide"). That mix is Thumb-2 in action.</li>
+  <li>There is no <code>str</code> here because the only result is a return value, which lives in a register (<code>r0</code>). Add a line like <code>out[0] = total;</code> and recompile — you will see a <code>str</code> appear, completing the load-compute-store trio.</li>
+</ul>
+
+<div class="box note">
+  <span class="box-title">Try this variation</span>
+  Change the function to write the result through a pointer (<code>void sum_into(const int32_t *data, uint32_t n, int32_t *out)</code> with <code>*out = total;</code>) and disassemble again. Find the new <code>str</code> instruction and confirm it is the <em>only</em> thing that writes to memory.
+</div>
+
+<h3>7.4 Hints</h3>
+<details class="hint">
+  <summary>Hint 1 — the loop body</summary>
+  <p>A textbook accumulate loop is all you need:</p>
+  <pre><code>for (uint32_t i = 0U; i &lt; n; i++)
+{
+    total += data[i];
+}</code></pre>
+  <p>Resist optimizing it. The clearer the C, the clearer the assembly.</p>
+</details>
+<details class="hint">
+  <summary>Hint 2 — "arm-none-eabi-gcc: command not found"</summary>
+  <p>The toolchain is not installed or not on your <code>PATH</code>. On Debian/Ubuntu: <code>sudo apt install gcc-arm-none-eabi</code>. On macOS with Homebrew: <code>brew install --cask gcc-arm-embedded</code>. The course README has full instructions. You can still complete the lesson from the annotated disassembly in §7.3.</p>
+</details>
+<details class="hint">
+  <summary>Hint 3 — which lines are the load-store pattern?</summary>
+  <p>Scan the <code>objdump</code> output for the mnemonics <code>ldr</code> (load) and <code>str</code> (store). Everything between them — <code>add</code>, <code>cmp</code>, <code>mov</code>, <code>adds</code> — operates on registers and immediates only. That separation <em>is</em> the load-store architecture. If you see an <code>ldr</code> feeding an <code>add</code> that feeds (eventually) an <code>str</code>, you have found the load → compute → store rhythm.</p>
+</details>
+
+<div class="box ok">
+  <span class="box-title">No solution file for this module</span>
+  Module 01 is theory + investigation, so there is nothing to flash and no <code>solutions/</code> file. The "answer" is your own disassembly compared against §7.3. The first firmware you build runs in <a href="../04-gpio-output/04-gpio-output.html">Module 04</a>.
+</div>
+
+<!-- ============================== QUESTIONS ============================== -->
+<span class="section-tag">Verification Questions</span>
+<h2>8. Check your understanding</h2>
+
+<details class="answer">
+  <summary>Q1. What does "load-store architecture" mean, in one sentence?</summary>
+  <p>Arithmetic and logic instructions operate only on registers (and immediates); the only way to access memory is through dedicated load (<code>ldr</code>) and store (<code>str</code>) instructions. So any computation on a value in memory is always load → compute-in-registers → store.</p>
+</details>
+<details class="answer">
+  <summary>Q2. Why does the Cortex-M3 (and the whole Cortex-M family) execute Thumb-2 and not the legacy 32-bit ARM instruction set?</summary>
+  <p>Code density. Microcontrollers have very little Flash (the STM32F100RBT6 has 128&nbsp;KB), so fitting more program into fewer bytes is critical. Thumb-2 mixes 16-bit and 32-bit encodings to get near-ARM performance with much tighter code, so ARM dropped the 4-byte-only ARM state from Cortex-M entirely. The core is always in Thumb state — which is why we always compile with <code>-mthumb</code>.</p>
+</details>
+<details class="answer">
+  <summary>Q3. How many bits wide is a Cortex-M3 general-purpose register, and how many are there?</summary>
+  <p>Each register is 32 bits wide. There are 16 of them, <code>r0</code>–<code>r15</code>; <code>r0</code>–<code>r12</code> are general-purpose, while <code>r13</code>=<code>sp</code>, <code>r14</code>=<code>lr</code>, and <code>r15</code>=<code>pc</code> have special roles.</p>
+</details>
+<details class="answer">
+  <summary>Q4. State one core tradeoff of RISC versus CISC.</summary>
+  <p>RISC instructions each do less, so a given task often needs <em>more</em> instructions (and more program memory in the naive case) than CISC — but each instruction is simple, fixed-format, and fast to decode, giving a smaller/lower-power core and far more predictable timing. CISC packs more work per instruction (and can be denser per operation) at the cost of complex, variable-length decoding. (Thumb-2 specifically attacks the code-size downside of RISC.)</p>
+</details>
+<details class="answer">
+  <summary>Q5. Naming the layers: what is the relationship between ARMv7-M, Cortex-M3, and STM32F100?</summary>
+  <p>ARMv7-M is the <em>architecture</em> — the contract of what instructions and registers exist. Cortex-M3 is ARM's specific <em>core</em> that implements ARMv7-M (3-stage pipeline, NVIC, SysTick, Thumb-2 only). STM32F100 is ST's <em>chip</em> that wraps a Cortex-M3 core with Flash, SRAM, and peripherals. (And STM32VLDISCOVERY is the <em>board</em> carrying that chip.)</p>
+</details>
+<details class="answer">
+  <summary>Q6. Why does "memory-mapped everything" make bare-metal C possible without special I/O instructions?</summary>
+  <p>Every peripheral register lives at a fixed address in the same flat 32-bit address space as RAM. Controlling hardware is therefore just reading and writing memory addresses — which in C means dereferencing a <code>volatile</code> pointer. No special instructions or OS calls are needed, and that is exactly what Module 03 builds on.</p>
+</details>
+
+<div class="modfooter">
+  <span class="disabled">Start of course</span>
+  <a href="../02-arm-programmer-model/02-arm-programmer-model.html">02 · ARM Programmer's Model →</a>
+</div>
+
+</div>
+</body>
+</html>

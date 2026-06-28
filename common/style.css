@@ -1,0 +1,265 @@
+/* ======================================================================
+ * style.css - shared styling for every HTML page in the bare-metal course
+ * Loaded by each module as  <link rel="stylesheet" href="../common/style.css">
+ * (the README/glossary at the repo root use href="common/style.css").
+ * ====================================================================== */
+
+:root {
+    --bg:        #0f1419;
+    --panel:     #1a212b;
+    --panel-2:   #222c38;
+    --ink:       #d7dde5;
+    --ink-dim:   #97a3b3;
+    --accent:    #4fc3f7;   /* cyan - links, headings accents      */
+    --accent-2:  #ffb74d;   /* amber - register names, warnings     */
+    --green:     #81c784;   /* success / verified                   */
+    --red:       #e57373;   /* danger / pitfalls                    */
+    --border:    #2e3a48;
+    --code-bg:   #11161c;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    line-height: 1.65;
+    font-size: 17px;
+}
+
+.wrap {
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 2rem 1.5rem 6rem;
+}
+
+/* ---- Top navigation bar ---- */
+.topnav {
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    padding: 0.6rem 1.5rem;
+    font-size: 0.9rem;
+    display: flex;
+    gap: 1rem;
+    flex-wrap: wrap;
+    align-items: center;
+}
+.topnav a { color: var(--accent); text-decoration: none; }
+.topnav a:hover { text-decoration: underline; }
+.topnav .spacer { flex: 1 1 auto; }
+.topnav .badge {
+    color: var(--ink-dim);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.1rem 0.5rem;
+    font-family: var(--mono);
+    font-size: 0.8rem;
+}
+
+/* ---- Headings ---- */
+h1 {
+    font-size: 1.9rem;
+    line-height: 1.2;
+    margin: 0.5rem 0 0.3rem;
+    color: #fff;
+}
+h1 .modnum {
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 1.1rem;
+    display: block;
+    margin-bottom: 0.2rem;
+}
+h2 {
+    margin-top: 2.6rem;
+    font-size: 1.4rem;
+    color: var(--accent);
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0.3rem;
+}
+h3 { margin-top: 1.8rem; font-size: 1.12rem; color: #fff; }
+h4 { margin-top: 1.3rem; font-size: 1rem; color: var(--accent-2); }
+
+a { color: var(--accent); }
+
+.subtitle { color: var(--ink-dim); font-size: 1.05rem; margin-top: 0; }
+
+/* ---- Section labels ---- */
+.section-tag {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 0.72rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    background: var(--panel-2);
+    color: var(--accent);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.15rem 0.55rem;
+    margin-bottom: 0.4rem;
+}
+
+/* ---- Code ---- */
+code {
+    font-family: var(--mono);
+    background: var(--code-bg);
+    color: var(--accent-2);
+    padding: 0.1rem 0.35rem;
+    border-radius: 4px;
+    font-size: 0.9em;
+}
+pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 6px;
+    padding: 1rem 1.1rem;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 0.86rem;
+    line-height: 1.5;
+}
+pre code { background: none; color: var(--ink); padding: 0; }
+
+/* lightweight syntax accents for hand-tagged spans inside <pre> */
+.k  { color: #c792ea; }  /* keyword   */
+.t  { color: #82aaff; }  /* type      */
+.s  { color: #c3e88d; }  /* string    */
+.n  { color: #f78c6c; }  /* number    */
+.c  { color: #5c6b7a; font-style: italic; }  /* comment */
+.r  { color: var(--accent-2); }  /* register / macro */
+
+/* ---- Callout boxes ---- */
+.box {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.9rem 1.1rem;
+    margin: 1.2rem 0;
+    background: var(--panel);
+}
+.box.note    { border-left: 4px solid var(--accent); }
+.box.warn    { border-left: 4px solid var(--accent-2); background: #2a2418; }
+.box.danger  { border-left: 4px solid var(--red); background: #2a1c1c; }
+.box.ok      { border-left: 4px solid var(--green); background: #1b2620; }
+.box .box-title { font-weight: 700; margin-bottom: 0.3rem; display:block; }
+.box.note   .box-title { color: var(--accent); }
+.box.warn   .box-title { color: var(--accent-2); }
+.box.danger .box-title { color: var(--red); }
+.box.ok     .box-title { color: var(--green); }
+
+/* ---- Tables (register bit fields) ---- */
+table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1.1rem 0;
+    font-size: 0.88rem;
+}
+th, td {
+    border: 1px solid var(--border);
+    padding: 0.45rem 0.6rem;
+    text-align: left;
+    vertical-align: top;
+}
+th { background: var(--panel-2); color: var(--accent); }
+tr:nth-child(even) td { background: rgba(255,255,255,0.02); }
+td code, th code { background: none; color: var(--accent-2); padding: 0; }
+
+/* ---- Collapsible hints / answers (native <details>) ---- */
+details {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin: 0.6rem 0;
+    padding: 0 1rem;
+}
+details[open] { padding-bottom: 0.8rem; }
+summary {
+    cursor: pointer;
+    padding: 0.7rem 0;
+    font-weight: 600;
+    color: var(--accent);
+    list-style: none;
+    user-select: none;
+}
+summary::-webkit-details-marker { display: none; }
+summary::before {
+    content: "\25B6";  /* right-pointing triangle */
+    display: inline-block;
+    margin-right: 0.6rem;
+    color: var(--ink-dim);
+    transition: transform 0.15s ease;
+    font-size: 0.8em;
+}
+details[open] > summary::before { transform: rotate(90deg); }
+details.hint summary    { color: var(--accent-2); }
+details.answer summary  { color: var(--green); }
+
+/* ---- ASCII-art / diagram blocks ---- */
+.diagram {
+    background: var(--code-bg);
+    border: 1px dashed var(--border);
+    border-radius: 6px;
+    padding: 1rem;
+    overflow-x: auto;
+    font-family: var(--mono);
+    font-size: 0.8rem;
+    line-height: 1.35;
+    color: var(--ink-dim);
+    white-space: pre;
+}
+
+/* ---- Register address quick-reference pills ---- */
+.reg-pill {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 0.8rem;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0.1rem 0.45rem;
+    margin: 0.1rem 0.15rem;
+    color: var(--accent-2);
+}
+
+/* ---- Module nav footer ---- */
+.modfooter {
+    margin-top: 4rem;
+    padding-top: 1.2rem;
+    border-top: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    font-size: 0.95rem;
+}
+.modfooter a {
+    text-decoration: none;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.6rem 0.9rem;
+    color: var(--accent);
+}
+.modfooter a:hover { background: var(--panel-2); }
+.modfooter .disabled { color: var(--ink-dim); border-color: var(--border); }
+
+/* ---- Misc ---- */
+ul, ol { padding-left: 1.4rem; }
+li { margin: 0.3rem 0; }
+hr { border: none; border-top: 1px solid var(--border); margin: 2rem 0; }
+kbd {
+    font-family: var(--mono);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-bottom-width: 2px;
+    border-radius: 4px;
+    padding: 0.05rem 0.4rem;
+    font-size: 0.85em;
+}
+.checklist { list-style: none; padding-left: 0; }
+.checklist li::before { content: "\2610  "; color: var(--accent-2); font-family: var(--mono); }
+.muted { color: var(--ink-dim); }
+.pipeline-step { color: var(--accent); font-weight: 700; }

@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10 · Interrupções e o NVIC — Bare-Metal STM32</title>
+<link rel="stylesheet" href="../common/style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <a href="../README-pt.md">Início</a>
+  <a href="../glossary-pt.html">Glossário</a>
+  <a href="../09-general-purpose-timers/09-general-purpose-timers-pt.html">‹ Anterior</a>
+  <a href="../11-dma/11-dma-pt.html">Seguinte ›</a>
+  <a href="10-interrupts-nvic.html">🌐 English</a>
+  <span class="spacer"></span>
+  <span class="badge">STM32F100RBT6 · RM0041</span>
+</nav>
+
+<div class="wrap">
+
+<h1><span class="modnum">Módulo 10</span> Interrupções e o NVIC</h1>
+<p class="subtitle">Como o Cortex-M3 aceita uma exceção, como o <code>NVIC</code> ativa e despacha uma IRQ de periférico, e uma demonstração real, testável em QEMU: uma interrupção de receção da USART1 (<code>RXNEIE</code> → <code>USART1_IRQHandler</code>, IRQ&nbsp;37).</p>
+
+<div class="box note">
+  <span class="box-title">Dependências</span>
+  Isto assenta diretamente no <a href="../07-uart-receive/07-uart-receive-pt.html">Módulo 07 (Receção UART)</a>, que recebia bytes por <em>polling</em> da flag <code>RXNE</code>. Aqui substituímos esse polling por uma interrupção. A tabela de vetores onde se vai ligar está em <code>common/startup.c</code> (explicada nos Módulos 02–03); a interrupção do SysTick do <a href="../08-systick-timer/08-systick-timer-pt.html">Módulo 08</a> foi a sua primeira amostra de uma ISR.
+</div>
+
+<!-- ============================== THEORY ============================== -->
+<span class="section-tag">Teoria</span>
+<h2>1. O que é uma interrupção, e porque a quer</h2>
+
+<p>Polling — ficar dentro de <code>while ((SR &amp; RXNE) == 0) {}</code> — desperdiça o CPU: não faz nada de útil enquanto espera, e só consegue vigiar uma coisa de cada vez. Uma <strong>interrupção</strong> inverte a relação. O periférico levanta um pedido quando precisa de atenção; o CPU larga o que está a fazer, corre uma curta <strong>Rotina de Serviço de Interrupção (ISR)</strong>, e depois retoma <em>exatamente</em> onde estava. O código de primeiro plano nunca faz polling.</p>
+
+<p>Num Cortex-M3 cada interrupção e falha é uma <strong>exceção</strong> com um número. Os números de exceção 1–15 são as <em>exceções de sistema</em> integradas no núcleo (Reset, NMI, HardFault, SVC, PendSV, <strong>SysTick</strong>, …). Os números de exceção 16+ são as <em>interrupções externas</em> dos periféricos, que também são numeradas a partir de zero como <strong>IRQ&nbsp;0, 1, 2, …</strong> (logo IRQ&nbsp;n = exceção&nbsp;n+16). O bloco que gere todas elas é o <strong>NVIC</strong>.</p>
+
+<h2>2. O NVIC — Nested Vectored Interrupt Controller</h2>
+<p>O NVIC faz parte do núcleo Cortex-M3 (não é um periférico STM32), mapeado no System Control Space em <code>0xE000Exxx</code>. As suas três funções estão no próprio nome:</p>
+<ul>
+  <li><strong>Nested</strong> (aninhado) — uma interrupção de prioridade mais alta pode preemptar uma ISR de prioridade mais baixa em execução.</li>
+  <li><strong>Vectored</strong> (vetorizado) — o hardware procura o endereço do tratador diretamente na <em>tabela de vetores</em>; não se escreve um despachante que pergunta "quem me interrompeu?".</li>
+  <li><strong>Interrupt Controller</strong> (controlador de interrupções) — guarda o estado de ativação, pendência e prioridade de cada IRQ.</li>
+</ul>
+
+<h3>2.1 O que o hardware faz quando uma IRQ dispara</h3>
+<div class="diagram">periférico (USART1) põe RXNE, RXNEIE=1  ──► pedido ao NVIC
+        │   NVIC: a IRQ 37 está ativada? prioridade suficiente?
+        ▼
+  O NÚCLEO ACEITA A EXCEÇÃO  (tudo em hardware, sem código):
+    1. empilha R0-R3, R12, LR, PC, xPSR na pilha atual   (8 palavras)
+    2. carrega PC a partir da posição da tabela de vetores para IRQ 37  (g_vector_table[53])
+    3. corre USART1_IRQHandler()  ── uma função C vulgar
+    4. ao regressar (BX LR com EXC_RETURN mágico): desempilha esses 8 registos
+        ▼
+  retoma a instrução interrompida como se nada tivesse acontecido</div>
+
+<p>Como os oito registos guardados pelo chamador são empilhados e restaurados <em>pelo hardware</em>, uma ISR no Cortex-M pode ser uma função C simples — <strong>não há prólogo/epílogo em assembly para escrever</strong>. É por isso que <code>common/startup.c</code> pode declarar cada tratador como um <code>void f(void)</code> normal.</p>
+
+<h3>2.2 A tabela de vetores é o mecanismo de despacho</h3>
+<p>"Vetorizado" significa que o tratador é encontrado por índice na tabela, e não por um <code>switch</code> em software. A posição 0 é o ponteiro de pilha inicial, a posição 1 é o <code>Reset_Handler</code>, as posições 2–15 são as exceções de sistema, e a posição <code>16 + n</code> é o tratador da IRQ&nbsp;n. Em <code>common/startup.c</code> cada entrada é um alias <code>WEAK</code> para <code>Default_Handler</code> (uma armadilha infinita). Quando o seu módulo define uma função com o nome correspondente — p. ex. <code>USART1_IRQHandler</code> — o linker sobrepõe-se ao símbolo fraco, e a posição 53 (IRQ&nbsp;37) passa a apontar para o <em>seu</em> código. "Regista-se" uma ISR simplesmente definindo uma função com o nome correto.</p>
+
+<h3>2.3 Ativar uma IRQ: os registos ISER</h3>
+<p>Uma IRQ não faz nada até a <em>ativar</em> no NVIC. Os registos set-enable são um pequeno array; escreva um <code>1</code> num bit para ativar essa linha (escrever <code>0</code> é ignorado, por isso não há read-modify-write nem corrida):</p>
+
+<table>
+  <tr><th>Registo</th><th>Endereço</th><th>Abrange</th></tr>
+  <tr><td><code>NVIC_ISER0</code></td><td><code>0xE000E100</code></td><td>IRQ 0 … 31 (bit n = IRQ n)</td></tr>
+  <tr><td><code>NVIC_ISER1</code></td><td><code>0xE000E104</code></td><td>IRQ 32 … 63 (bit n = IRQ 32+n)</td></tr>
+  <tr><td><code>NVIC_ICER0/1</code></td><td><code>0xE000E180</code></td><td>clear-enable (desativar uma IRQ)</td></tr>
+  <tr><td><code>NVIC_ISPR0/1</code></td><td><code>0xE000E200</code></td><td>set-pending (disparar uma IRQ por software)</td></tr>
+  <tr><td><code>NVIC_IPRn</code></td><td><code>0xE000E400</code></td><td>prioridade, um byte por IRQ — só os 4 bits de topo são usados</td></tr>
+</table>
+
+<p>A aritmética de índice/bit é o coração deste módulo. Para a IRQ&nbsp;<code>n</code>:</p>
+<div class="diagram">índice do registo =  n / 32   (qual palavra ISER)
+posição do bit    =  n % 32   (qual bit nessa palavra)
+
+   NVIC_ISER[n / 32] = (1U &lt;&lt; (n % 32));
+
+Exemplo — USART1 = IRQ 37:
+   índice = 37 / 32 = 1   → ISER1 (0xE000E104)
+   bit    = 37 % 32 = 5
+   ⇒ *(volatile uint32_t*)0xE000E104 = (1U &lt;&lt; 5);</div>
+
+<table>
+  <tr><th>Periférico</th><th>IRQ #</th><th>Registo ISER</th><th>Bit</th></tr>
+  <tr><td>EXTI linha 0 (botão PA0)</td><td>6</td><td>ISER0</td><td>6</td></tr>
+  <tr><td>TIM3</td><td>29</td><td>ISER0</td><td>29</td></tr>
+  <tr><td>USART1</td><td>37</td><td>ISER1</td><td>5</td></tr>
+  <tr><td>USART2</td><td>38</td><td>ISER1</td><td>6</td></tr>
+</table>
+<p class="muted">Os números de IRQ são da Tabela 51 do RM0041. <strong>O SysTick é diferente</strong>: é uma <em>exceção de sistema</em> (número 15), não uma IRQ externa, por isso não tem qualquer bit ISER — ativa-se através de <code>SYST_CSR.TICKINT</code> (Módulo 08). As prioridades (IPR) estão fora do âmbito aqui; a prioridade de reset 0 funciona bem para uma única interrupção.</p>
+
+<h2>3. EXTI: fazer um pino GPIO interromper (o botão)</h2>
+<p>Um pino GPIO não consegue acionar uma IRQ sozinho. O controlador <strong>EXTI</strong> (External Interrupt/event) fica entre os pinos e o NVIC. Para fazer o botão de utilizador <strong>B1 = PA0</strong> gerar uma interrupção, faria, conceptualmente:</p>
+<ol>
+  <li>Dar relógio ao <code>AFIO</code>, depois apontar a linha&nbsp;0 do EXTI para o <em>porto A</em> em <code>AFIO_EXTICR1</code> (0x40010008).</li>
+  <li><strong>Desmascarar</strong> a linha 0 em <code>EXTI_IMR</code> (0x40010400+0x00, pôr o bit 0).</li>
+  <li>Selecionar o flanco: ascendente em <code>EXTI_RTSR</code> (offset 0x08, bit 0) — o botão é ativo-alto.</li>
+  <li>Ativar a IRQ&nbsp;6 (EXTI0) no NVIC: <code>ISER0 |= (1U &lt;&lt; 6)</code>.</li>
+  <li>No <code>EXTI0_IRQHandler</code>, <strong>limpar o bit de pendência</strong> escrevendo <code>1</code> no bit 0 de <code>EXTI_PR</code> (offset 0x14). O EXTI_PR é <em>write-1-to-clear</em>; se se esquecer disto o tratador volta a disparar para sempre.</li>
+</ol>
+
+<div class="box warn">
+  <span class="box-title">O QEMU não consegue carregar no botão</span>
+  Segundo a matriz de emulação verificada, o <code>qemu-system-arm -M stm32vldiscovery</code> <strong>não emula GPIO nem entrada de botão de todo</strong> — o <code>IDR</code> lê 0 e nunca é produzido qualquer flanco no pino. Por isso, embora a configuração EXTI/NVIC acima esteja correta para hardware real, não é possível acionar uma IRQ de botão no QEMU. Cobrimos portanto o EXTI conceptualmente e fazemos da demonstração <em>funcional</em> um periférico que o QEMU <em>de facto</em> emula por completo: a USART.
+</div>
+
+<h2>4. A interrupção demonstrável: USART1 RX (RXNE → IRQ 37)</h2>
+<p>O QEMU emula por completo as USARTs, <em>incluindo</em> levantar a interrupção da USART1 quando chega um byte. Por isso transformamos o eco por polling do Módulo 07 num eco guiado por interrupção:</p>
+<ul>
+  <li>Pôr <code>RXNEIE</code> (<code>USART1_CR1</code> bit&nbsp;5): agora, sempre que <code>RXNE</code> passa a 1, a USART afirma a sua linha de IRQ.</li>
+  <li>Ativar a IRQ&nbsp;37 no NVIC (<code>ISER1</code> bit&nbsp;5).</li>
+  <li>No <code>USART1_IRQHandler</code>: confirmar <code>RXNE</code>, <strong>ler <code>DR</code></strong> (isto devolve o byte <em>e</em> limpa <code>RXNE</code>, retirando a afirmação do pedido), ecoá-lo, e incrementar um contador.</li>
+</ul>
+
+<h3>4.1 Partilhar dados com o tratador: <code>volatile</code></h3>
+<p>A ISR corre de forma assíncrona em relação a <code>main()</code>. Qualquer variável que ambos toquem tem de ser declarada <code>volatile</code>, ou o otimizador pode mantê-la em cache num registo dentro do ciclo de <code>main()</code> e nunca ver as atualizações do tratador:</p>
+<pre><code>static volatile uint32_t g_rx_count = 0U;   /* escrito pela ISR, lido pelo main */</code></pre>
+<p>Para dados mais largos do que uma palavra alinhada de 32 bits, também precisa de uma <strong>secção crítica</strong> — desativar interrupções por breves instantes para que <code>main()</code> leia um instantâneo consistente. No Cortex-M isso é <code>__asm volatile("cpsid i")</code> (mascarar) … <code>"cpsie i"</code> (desmascarar), ou o registo <code>PRIMASK</code>. O nosso contador é uma única palavra, por isso um simples <code>volatile</code> basta aqui.</p>
+
+<!-- ============================== EXERCISE ============================== -->
+<span class="section-tag">Exercício Guiado</span>
+<h2>5. Eco UART guiado por interrupção</h2>
+
+<p><strong>Objetivo:</strong> receber bytes pela USART1 usando uma interrupção em vez de polling. O <code>main()</code> nunca pode ler <code>DR</code>; a ISR faz todo o trabalho e reporta através de um contador <code>volatile</code>.</p>
+
+<h3>5.1 Esqueleto — criar <code>10-interrupts-nvic/main.c</code></h3>
+<p>Preencha cada <code>TODO</code>. O auxiliar de TX e o retarget do printf são dados (reutilizados dos Módulos 06/07); o seu trabalho é a matemática de ativação do NVIC, o bit <code>RXNEIE</code>, e o corpo da ISR.</p>
+
+<pre><code>#include &lt;stdint.h&gt;
+#include &lt;stdio.h&gt;
+
+#define RCC_APB2ENR   (*(volatile uint32_t *)0x40021018U)
+#define RCC_IOPAEN    (1U &lt;&lt; 2)
+#define RCC_USART1EN  (1U &lt;&lt; 14)
+
+#define GPIOA_CRH     (*(volatile uint32_t *)0x40010804U)
+
+#define USART1_SR     (*(volatile uint32_t *)0x40013800U)
+#define USART1_DR     (*(volatile uint32_t *)0x40013804U)
+#define USART1_BRR    (*(volatile uint32_t *)0x40013808U)
+#define USART1_CR1    (*(volatile uint32_t *)0x4001380CU)
+
+#define USART_SR_RXNE    (1U &lt;&lt; 5)
+#define USART_SR_TXE     (1U &lt;&lt; 7)
+#define USART_CR1_RE     (1U &lt;&lt; 2)
+#define USART_CR1_TE     (1U &lt;&lt; 3)
+#define USART_CR1_RXNEIE (1U &lt;&lt; 5)    /* ativacao da interrupcao RXNE */
+#define USART_CR1_UE     (1U &lt;&lt; 13)
+
+/* Registos set-enable do NVIC (array a comecar em 0xE000E100) */
+#define NVIC_ISER ((volatile uint32_t *)0xE000E100U)
+#define USART1_IRQn  (37U)            /* RM0041 Tabela 51 */
+
+/* Partilhado com a ISR -> TEM de ser volatile */
+static volatile uint32_t g_rx_count  = 0U;
+static volatile uint8_t  g_last_char = 0U;
+
+static void uart_putc(uint8_t c)
+{
+    while ((USART1_SR &amp; USART_SR_TXE) == 0U) { }
+    USART1_DR = (uint32_t)c;
+}
+
+static void nvic_enable_irq(uint32_t irqn)
+{
+    /* TODO 1: ativar a IRQ 'irqn' no NVIC.
+     *   indice = irqn / 32  (usar irqn &gt;&gt; 5)
+     *   bit    = irqn % 32  (usar irqn &amp; 0x1F)
+     *   escrever (1U &lt;&lt; bit) em NVIC_ISER[indice]  -- um unico store, sem RMW. */
+}
+
+static void uart_init(void)
+{
+    RCC_APB2ENR |= (RCC_IOPAEN | RCC_USART1EN);
+    /* PA9 = AF push-pull (TX) nibble 0xB, PA10 = entrada flutuante (RX) nibble 0x4 */
+    GPIOA_CRH = (GPIOA_CRH &amp; ~((0xFU &lt;&lt; 4) | (0xFU &lt;&lt; 8)))
+              | (0xBU &lt;&lt; 4) | (0x4U &lt;&lt; 8);
+    USART1_BRR = 0x0341U;             /* 9600 @ 8 MHz */
+
+    /* TODO 2: ativar TE, RE, a interrupcao RXNE (RXNEIE), e UE em CR1.
+     *         RXNEIE e o que faz RXNE levantar uma interrupcao em vez de
+     *         apenas por uma flag. */
+
+    /* TODO 3: ativar a linha da USART1 no NVIC (chamar nvic_enable_irq). */
+}
+
+void USART1_IRQHandler(void);
+void USART1_IRQHandler(void)
+{
+    /* TODO 4: enquanto RXNE estiver posto:
+     *   - ler USART1_DR para um uint8_t (esta leitura limpa RXNE -> retira a
+     *     afirmacao da interrupcao; esquece-la faz o tratador redisparar para sempre)
+     *   - ecoar o byte com uart_putc; se foi '\r', enviar tambem '\n'
+     *   - guarda-lo em g_last_char e incrementar g_rx_count
+     * Drenar num ciclo while e robusto se varios bytes estiverem em fila. */
+}
+
+int _write(int fd, const char *buf, int len)
+{
+    int i;
+    (void)fd;
+    for (i = 0; i &lt; len; i++) {
+        if (buf[i] == '\n') { uart_putc((uint8_t)'\r'); }
+        uart_putc((uint8_t)buf[i]);
+    }
+    return len;
+}
+
+int main(void)
+{
+    uint32_t seen = 0U;
+
+    uart_init();
+    (void)setvbuf(stdout, NULL, _IONBF, 0);
+    printf("\nUSART1 RX interrupt ready (IRQ 37). Type something.\n");
+
+    /* main() NUNCA le DR. So reporta o que a ISR entregou.
+     * Sem espera por flag aqui -- a interrupcao faz a rececao. */
+    for (;;)
+    {
+        if (g_rx_count != seen)
+        {
+            seen = g_rx_count;
+            printf("[main] byte #%u: 0x%02X\n",
+                   (unsigned int)seen, (unsigned int)g_last_char);
+        }
+    }
+}
+
+/* stubs da newlib (manter o link sem avisos) */
+int _read(int fd, char *b, int l)  { (void)fd; (void)b; (void)l; return 0; }
+int _close(int fd)                 { (void)fd; return -1; }
+int _lseek(int fd, int o, int d)   { (void)fd; (void)o; (void)d; return 0; }
+int _isatty(int fd)                { (void)fd; return 1; }
+int _fstat(int fd, void *s)        { (void)fd; (void)s; return 0; }
+</code></pre>
+
+<h3>5.2 Compilar e correr</h3>
+<p>De dentro da pasta <code>10-interrupts-nvic/</code>:</p>
+<pre><code>make -f ../common/Makefile SRC=main.c</code></pre>
+<p>Corra interativamente e escreva, ou canalize entrada <em>após um pequeno atraso</em> para que os bytes cheguem assim que a interrupção estiver armada:</p>
+<pre><code>(sleep 1; printf 'AB') | qemu-system-arm -M stm32vldiscovery -display none \
+    -serial stdio -serial null -serial null -kernel build/firmware.elf</code></pre>
+<p>Deverá ver <code>AB</code> ecoado pela ISR, depois uma linha de relatório <code>[main] byte #…</code>. Saia com <kbd>Ctrl-A</kbd> seguido de <kbd>X</kbd>.</p>
+
+<div class="box warn">
+  <span class="box-title">Porque é que o <code>sleep 1</code> importa no QEMU</span>
+  O QEMU carrega <em>instantaneamente</em> o stdin canalizado e pode entregá-lo antes de o guest terminar o reset, por isso <code>printf 'AB' | qemu…</code> pode falhar os bytes por completo — isto afeta até o recetor por polling do Módulo 07, logo não é um bug de interrupção. Um pequeno <code>sleep</code> (ou simplesmente escrever interativamente) faz os bytes chegarem depois de <code>uart_init()</code> ter armado o <code>RXNEIE</code> e o NVIC. Isto é puramente uma peculiaridade de temporização do lado do host; em hardware real a interrupção dispara sempre que um byte realmente chega.
+</div>
+
+<h3>5.3 Pistas</h3>
+<details class="hint">
+  <summary>Pista 1 — a ativação do NVIC (TODO 1)</summary>
+  <p>Os registos ISER formam um array de 32 bits em <code>0xE000E100</code>. Para a IRQ <code>n</code>, a palavra é <code>n / 32</code> e o bit é <code>n % 32</code>. Usando shifts/máscaras:
+  <code>NVIC_ISER[irqn &gt;&gt; 5U] = (1U &lt;&lt; (irqn &amp; 0x1FU));</code> Sem read-modify-write: estes são registos write-1-to-set, por isso escrever o único bit não perturba os outros.</p>
+</details>
+<details class="hint">
+  <summary>Pista 2 — armar a fonte (TODO 2 e 3)</summary>
+  <p>Um store combinado resolve:
+  <code>USART1_CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE | USART_CR1_UE;</code>
+  Depois <code>nvic_enable_irq(USART1_IRQn);</code>. São precisas as duas metades: <code>RXNEIE</code> deixa a USART <em>levantar</em> o pedido, o bit do NVIC deixa o núcleo <em>aceitá-lo</em>. Omita qualquer uma e nada dispara.</p>
+</details>
+<details class="hint">
+  <summary>Pista 3 — o corpo da ISR (TODO 4)</summary>
+  <p><code>while ((USART1_SR &amp; USART_SR_RXNE) != 0U) { uint8_t c = (uint8_t)(USART1_DR &amp; 0xFFU); uart_putc(c); if (c=='\r') uart_putc('\n'); g_last_char=c; g_rx_count++; }</code>
+  A leitura de <code>USART1_DR</code> é o que limpa <code>RXNE</code> — esse é o seu reconhecimento ao hardware. Não é preciso guardar/restaurar registos manualmente; o núcleo empilhou o seu contexto antes de entrar.</p>
+</details>
+
+<div class="box ok">
+  <span class="box-title">Solução de referência</span>
+  Solução completa e comentada: <code>solutions/10-interrupts-nvic.c</code>. Também pendura a IRQ por software uma vez na inicialização (via <code>NVIC_ISPR</code>) para cobrir o caso em que um byte já estava à espera quando a interrupção foi armada. Tente todas as pistas primeiro.
+</div>
+
+<!-- ============================== QUESTIONS ============================== -->
+<span class="section-tag">Perguntas de Verificação</span>
+<h2>6. Verifique a sua compreensão</h2>
+
+<details class="answer">
+  <summary>P1. O TIM3 é IRQ 29 e a USART2 é IRQ 38. Que registo ISER e que bit ativa cada um?</summary>
+  <p>Índice = IRQ/32, bit = IRQ%32.<br>
+  <strong>TIM3 (29):</strong> 29/32 = 0 → <code>ISER0</code> (0xE000E100), bit 29%32 = <strong>29</strong>.<br>
+  <strong>USART2 (38):</strong> 38/32 = 1 → <code>ISER1</code> (0xE000E104), bit 38%32 = <strong>6</strong>.<br>
+  Logo <code>ISER0 = (1U &lt;&lt; 29)</code> e <code>ISER1 = (1U &lt;&lt; 6)</code> respetivamente.</p>
+</details>
+<details class="answer">
+  <summary>P2. Porque é que uma ISR no Cortex-M3 não precisa de guardar/restaurar registos manualmente (sem prólogo em assembly)?</summary>
+  <p>Na entrada da exceção o núcleo empilha <em>automaticamente</em> os oito registos guardados pelo chamador (R0–R3, R12, LR, PC, xPSR) na pilha ativa, e no regresso da exceção desempilha-os de volta. A convenção de chamada de C diz que uma função pode usar livremente esses registos, e os guardados pelo chamado tem de preservá-los ela própria — o que o compilador já faz. Por isso a frame empilhada pelo hardware mais a geração normal de código C significam que uma função C simples é um tratador completo e correto. (É por isso que <code>common/startup.c</code> declara os tratadores como <code>void f(void)</code> vulgares.)</p>
+</details>
+<details class="answer">
+  <summary>P3. Porque é que uma variável partilhada entre uma ISR e o <code>main()</code> tem de ser <code>volatile</code>?</summary>
+  <p>A ISR corre de forma assíncrona, por isso, do ponto de vista do compilador, o <code>main()</code> parece ser o único escritor dessa variável. Sem <code>volatile</code> pode legalmente içar a variável para um registo no topo de um ciclo e nunca reler a memória, por isso nunca observa as atualizações da ISR (o ciclo ficaria a girar para sempre num valor obsoleto). O <code>volatile</code> força um acesso real à memória em cada leitura/escrita. (Para dados de várias palavras precisa adicionalmente de uma secção crítica — mascarar brevemente as interrupções com <code>cpsid i</code>/<code>cpsie i</code> — para que o leitor obtenha um instantâneo consistente.)</p>
+</details>
+<details class="answer">
+  <summary>P4. Qual é a diferença entre uma "exceção de sistema" como o SysTick e uma "interrupção externa" como a USART1?</summary>
+  <p>As exceções de sistema (números 1–15: Reset, NMI, HardFault, SVC, PendSV, SysTick, …) estão integradas no próprio núcleo Cortex-M3; não estão no espaço de numeração de IRQ do NVIC e <strong>não têm bit ISER</strong>. O SysTick, por exemplo, é ativado através do seu próprio bit <code>SYST_CSR.TICKINT</code> (Módulo 08). As interrupções externas são as IRQs dos periféricos, numeradas a partir de 0 (exceção 16+), e cada uma é ativada/desativada/priorizada individualmente através dos registos ISER/ICER/IPR do NVIC. Ambos os tipos despacham pela mesma tabela de vetores.</p>
+</details>
+<details class="answer">
+  <summary>P5. Para uma interrupção EXTI (botão), como se limpa a flag de pendência, e o que acontece se a esquecer?</summary>
+  <p>Escreve-se um <strong>1</strong> no bit correspondente de <code>EXTI_PR</code> (Pending Register, offset 0x14) — é write-1-to-clear, por isso escrever 1 limpa a flag e 0 deixa-a inalterada. Se a esquecer, a linha EXTI fica pendente: no momento em que o tratador regressa, o NVIC vê o pedido ainda afirmado e reentra imediatamente no tratador, parecendo disparar para sempre. O mesmo princípio aplica-se a toda a interrupção — o tratador tem de limpar a fonte (para a receção USART é o ato de <em>ler DR</em>; para o TIM é limpar o <code>UIF</code> em <code>SR</code>).</p>
+</details>
+
+<div class="modfooter">
+  <a href="../09-general-purpose-timers/09-general-purpose-timers-pt.html">← 09 · Temporizadores de Uso Geral</a>
+  <a href="../11-dma/11-dma-pt.html">11 · DMA →</a>
+</div>
+
+</div>
+</body>
+</html>

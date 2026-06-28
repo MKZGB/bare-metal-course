@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>12 · Driver I2C — Bare-Metal STM32</title>
+<link rel="stylesheet" href="../common/style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <a href="../README-pt.md">Início</a>
+  <a href="../glossary-pt.html">Glossário</a>
+  <a href="../11-dma/11-dma-pt.html">‹ Anterior</a>
+  <a href="../13-spi/13-spi-pt.html">Seguinte ›</a>
+  <a href="12-i2c.html">🌐 English</a>
+  <span class="spacer"></span>
+  <span class="badge">STM32F100RBT6 · RM0041</span>
+</nav>
+
+<div class="wrap">
+
+<h1><span class="modnum">Módulo 12</span> Driver I2C — A Máquina de Estados do Mestre</h1>
+<p class="subtitle">Coloca o <code>I2C1</code> a funcionar ao nível dos registos (<code>CR1/CR2/CCR/TRISE</code>) e percorre a sequência de transmissão do mestre — <code>START</code> → <code>SB</code> → endereço → <code>ADDR</code> → dados → <code>BTF</code> → <code>STOP</code> — passo a passo. Narramos cada passo através da UART porque <strong>o QEMU não emula I2C</strong>.</p>
+
+<div class="box note">
+  <span class="box-title">Dependências</span>
+  Este módulo reutiliza o driver UART por sondagem (polled) e o redireccionamento do <code>printf</code> do <a href="../06-uart-transmit/06-uart-transmit-pt.html">Módulo 06</a> para narrar a sequência I2C, e o padrão de espera limitada introduzido para periféricos não emulados no <a href="../11-dma/11-dma-pt.html">Módulo 11 (DMA)</a>. A configuração dos pinos GPIO (<code>CRL/CRH</code>) vem do <a href="../04-gpio-output/04-gpio-output-pt.html">Módulo 04</a>.
+</div>
+
+<!-- ============================== THEORY ============================== -->
+<span class="section-tag">Teoria</span>
+<h2>1. O que é o I2C</h2>
+
+<p>O <strong>I2C</strong> (Inter-Integrated Circuit) é um barramento série de dois fios e múltiplos pontos (multi-drop). Duas linhas open-drain são partilhadas por todos os dispositivos:</p>
+<ul>
+  <li><strong>SCL</strong> — o relógio, sempre conduzido pelo <em>mestre</em>.</li>
+  <li><strong>SDA</strong> — dados bidireccionais.</li>
+</ul>
+<p>Como as linhas são <strong>open-drain</strong> com resistências de pull-up externas, um dispositivo só pode puxar uma linha para <em>baixo</em>; os pull-ups levam-na para nível alto quando ninguém a conduz. É por isto que os pinos do STM32 têm de ser configurados como <strong>função alternada open-drain</strong> (não push-pull). Na STM32VLDISCOVERY, o <code>I2C1</code> usa <strong>SCL = PB6</strong> e <strong>SDA = PB7</strong>.</p>
+
+<h3>1.1 Mestres, escravos e endereçamento</h3>
+<ul>
+  <li>Um <strong>mestre</strong> inicia e termina cada transacção e fornece o relógio. Um <strong>escravo</strong> responde quando é endereçado.</li>
+  <li>Cada escravo tem um <strong>endereço de 7 bits</strong>. O mestre envia esse endereço no primeiro byte, deslocado um bit para a esquerda, sendo o bit menos significativo a flag <strong>R/W</strong> (<code>0</code> = escrita, <code>1</code> = leitura). Assim, uma escrita no endereço <code>0x53</code> coloca <code>(0x53&nbsp;&lt;&lt;&nbsp;1)&nbsp;|&nbsp;0 = 0xA6</code> no barramento.</li>
+  <li>Após cada byte, o receptor puxa SDA para baixo durante um ciclo de relógio para <strong>ACK</strong> (confirmar). Deixá-la em nível alto é um <strong>NACK</strong> (sem dispositivo, ou "para de enviar").</li>
+</ul>
+
+<h3>1.2 Os quatro eventos do barramento</h3>
+<div class="diagram">START : o mestre puxa SDA para baixo com SCL em nivel alto -> "estou a tomar o barramento"
+STOP  : o mestre liberta SDA para alto com SCL em nivel alto -> "o barramento esta livre"
+ACK   : o receptor puxa SDA para baixo no 9o ciclo          -> "byte recebido"
+NACK  : o receptor deixa SDA em nivel alto no 9o ciclo      -> "nenhum/ultimo byte"
+
+Clock stretching: um escravo que precisa de tempo mantem SCL em nivel BAIXO. O mestre
+tem de esperar ate SCL ser libertada antes de continuar - o hardware faz isto
+por ti, mas e por isto que uma transferencia pode pausar a meio de um byte.</div>
+
+<h2>2. A máquina de estados dos registos do I2C1</h2>
+<p>Não fazes bit-bang das linhas. O periférico executa o protocolo; <em>tu</em> conduzes uma pequena máquina de estados escrevendo bits de controlo e sondando flags de estado. (RM0041 §26.)</p>
+
+<table>
+  <tr><th>Registo</th><th>Endereço</th><th>Bits-chave</th></tr>
+  <tr><td><code>I2C1_CR1</code></td><td><code>0x40005400</code></td><td>bit0 <code>PE</code> (activar), bit8 <code>START</code>, bit9 <code>STOP</code>, bit10 <code>ACK</code></td></tr>
+  <tr><td><code>I2C1_CR2</code></td><td><code>0x40005404</code></td><td>bits[5:0] <code>FREQ</code> = relógio APB1 em MHz (= 8)</td></tr>
+  <tr><td><code>I2C1_OAR1</code></td><td><code>0x40005408</code></td><td>endereço próprio (modo escravo)</td></tr>
+  <tr><td><code>I2C1_DR</code></td><td><code>0x40005410</code></td><td>registo de dados (escreve endereço/dados, lê recebidos)</td></tr>
+  <tr><td><code>I2C1_SR1</code></td><td><code>0x40005414</code></td><td>bit0 <code>SB</code>, bit1 <code>ADDR</code>, bit2 <code>BTF</code>, bit6 <code>RxNE</code>, bit7 <code>TxE</code></td></tr>
+  <tr><td><code>I2C1_SR2</code></td><td><code>0x40005418</code></td><td>bit1 <code>BUSY</code> (lê após SR1 para limpar ADDR)</td></tr>
+  <tr><td><code>I2C1_CCR</code></td><td><code>0x4000541C</code></td><td>controlo de relógio — define a frequência de SCL</td></tr>
+  <tr><td><code>I2C1_TRISE</code></td><td><code>0x40005420</code></td><td>tempo de subida máximo de SCL</td></tr>
+</table>
+
+<h3>2.1 Configuração de temporização (relógios)</h3>
+<p>O I2C1 reside no <strong>APB1</strong>, com relógio a <strong>8 MHz</strong> nesta placa (HSI, sem PLL). Três números configuram o barramento:</p>
+<ul>
+  <li><code>CR2.FREQ</code> indica ao periférico o seu relógio de entrada em MHz para que possa derivar a temporização interna. <code>FREQ = 8</code>.</li>
+  <li><code>CCR</code> divide esse relógio até ao período de SCL. Para o modo padrão de 100&nbsp;kHz: <code>CCR = PCLK1 / (2 × SCL) = 8&nbsp;000&nbsp;000 / (2 × 100&nbsp;000) = 40</code>.</li>
+  <li><code>TRISE</code> limita o tempo de subida: <code>(1000&nbsp;ns / T<sub>PCLK1</sub>) + 1 = (1000 / 125) + 1 = 9</code>.</li>
+</ul>
+
+<h3>2.2 A sequência de transmissão do mestre</h3>
+<p>Este é o coração do módulo. Cada passo escreve um bit de controlo ou DR e depois <em>espera por uma flag de estado</em> antes do seguinte:</p>
+<div class="diagram">1. CR1.PE = 1                       activa o periferico
+2. CR1.START = 1                    pede uma condicao de START
+3. espera SR1.SB == 1               START esta na linha
+4. DR = (addr &lt;&lt; 1) | 0            envia endereco de 7 bits + bit de escrita
+5. espera SR1.ADDR == 1             o escravo fez ACK ao seu endereco
+6. le SR1, depois le SR2            &lt;-- isto LIMPA a flag ADDR
+7. DR = data                        carrega um byte de dados
+8. espera SR1.TxE / SR1.BTF         byte enviado
+9. CR1.STOP = 1                     liberta o barramento</div>
+
+<p>O passo 6 é o famoso truque: <strong>ADDR é limpa lendo <code>SR1</code> e depois <code>SR2</code></strong>, por essa ordem. Até o fazeres, SCL fica esticada em nível baixo e a transferência está parada. Este estranho padrão de "ler dois registos para limpar uma flag" existe para que o hardware possa apresentar ambas as palavras de estado de forma atómica; vê as perguntas de verificação.</p>
+
+<div class="box danger">
+  <span class="box-title">⚠ O QEMU NÃO emula I2C — e não há dispositivo escravo</span>
+  <p>O <code>qemu-system-arm -M stm32vldiscovery</code> emula <strong>nenhum periférico I2C</strong> e <strong>não há nenhum dispositivo no barramento</strong> (o acelerómetro ADXL345 usado como exemplo abaixo <strong>não está presente</strong>). Concretamente:</p>
+  <ul>
+    <li>as escritas nos registos I2C são silenciosamente descartadas;</li>
+    <li>as leituras de <code>SR1</code>/<code>SR2</code> devolvem <code>0</code>;</li>
+    <li><code>SB</code>, <code>ADDR</code>, <code>BTF</code>, <code>TxE</code> <strong>nunca são activadas</strong>.</li>
+  </ul>
+  <p>Por isso a sequência <strong>não consegue passar do passo 3</strong> no QEMU — e isso é <em>esperado</em>. O objectivo deste módulo é compreender a <strong>máquina de estados dos registos</strong>, não ler um sensor real. Um ingénuo <code>while(!(SR1 &amp; SB)){}</code> faria o programa bloquear <em>para sempre</em>. TENS de usar uma <strong>espera limitada</strong> em cada sondagem de flag e imprimir até que passo chegaste.</p>
+</div>
+
+<div class="box warn">
+  <span class="box-title">A regra da espera limitada</span>
+  Nunca escrevas um <code>while(!(REG &amp; FLAG)){}</code> ilimitado para uma flag que o QEMU nunca activa. Usa um contador de guarda que decrementa e, em caso de timeout, imprime uma explicação e continua:
+<pre><code>uint32_t guard = 200000U;
+while (((I2C1_SR1 &amp; I2C_SR1_SB) == 0U) &amp;&amp; (guard &gt; 0U)) { guard--; }
+if (guard == 0U) { printf("SB not set - I2C not emulated in QEMU; correct on hardware\n"); }</code></pre>
+  Em hardware real a flag activa rapidamente e o ciclo sai cedo — o mesmo código está correcto nesse caso.
+</div>
+
+<!-- ============================== EXERCISE ============================== -->
+<span class="section-tag">Exercício Guiado</span>
+<h2>3. Percorre a máquina de estados, narrando cada passo</h2>
+
+<p><strong>Objectivo:</strong> escrever <code>i2c1_init()</code> e um <code>i2c_write_byte()</code> que percorra a sequência de transmissão do mestre com esperas de flags <strong>limitadas</strong>, fazendo <code>printf</code> de cada passo. O programa tem de chegar ao fim e imprimir uma linha "done" — <strong>nunca</strong> pode bloquear. O alvo é o ADXL345 (endereço <code>0x53</code>), usado apenas como exemplo ilustrativo; não está presente no QEMU.</p>
+
+<h3>3.1 Esqueleto — cria <code>12-i2c/main.c</code></h3>
+<p>O driver UART e o redireccionamento do <code>printf</code> estão mostrados recolhidos (escreveste-os no Módulo 06). Preenche cada <code>TODO</code>. Não olhes para a solução de referência até teres tentado as dicas.</p>
+
+<details class="hint">
+  <summary>Mostrar o boilerplate UART / printf (do Módulo 06)</summary>
+<pre><code>#include &lt;stdint.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;sys/stat.h&gt;
+
+#define RCC_APB2ENR  (*(volatile uint32_t *)0x40021018U)
+#define RCC_IOPAEN   (1U &lt;&lt; 2)
+#define RCC_USART1EN (1U &lt;&lt; 14)
+#define GPIOA_CRH    (*(volatile uint32_t *)0x40010804U)
+#define USART1_SR    (*(volatile uint32_t *)0x40013800U)
+#define USART1_DR    (*(volatile uint32_t *)0x40013804U)
+#define USART1_BRR   (*(volatile uint32_t *)0x40013808U)
+#define USART1_CR1   (*(volatile uint32_t *)0x4001380CU)
+
+static void uart_init(void) {
+    RCC_APB2ENR |= (RCC_IOPAEN | RCC_USART1EN);
+    GPIOA_CRH = (GPIOA_CRH &amp; ~(0xFU &lt;&lt; 4)) | (0xBU &lt;&lt; 4); /* PA9 AF PP */
+    USART1_BRR = 0x341U;                                   /* 9600 @ 8MHz */
+    USART1_CR1 = (1U &lt;&lt; 3) | (1U &lt;&lt; 13);                     /* TE | UE */
+}
+static void uart_putc(uint8_t c) {
+    while ((USART1_SR &amp; (1U &lt;&lt; 7)) == 0U) { }
+    USART1_DR = (uint32_t)c;
+}
+int _write(int fd, const char *buf, int len) {
+    int i; (void)fd;
+    for (i = 0; i &lt; len; i++) { if (buf[i]=='\n') uart_putc((uint8_t)'\r'); uart_putc((uint8_t)buf[i]); }
+    return len;
+}
+int _read(int fd,char*b,int l){(void)fd;(void)b;(void)l;return 0;}
+int _close(int fd){(void)fd;return -1;}
+int _lseek(int fd,int o,int d){(void)fd;(void)o;(void)d;return 0;}
+int _isatty(int fd){(void)fd;return 1;}
+int _fstat(int fd,struct stat*s){(void)fd;if(s)s-&gt;st_mode=S_IFCHR;return 0;}</code></pre>
+</details>
+
+<pre><code>/* ---- registos I2C1 (RM0041 sec.26) ---- */
+#define RCC_APB1ENR  (*(volatile uint32_t *)0x4002101CU)
+#define RCC_IOPBEN   (1U &lt;&lt; 3)
+#define RCC_AFIOEN   (1U &lt;&lt; 0)
+#define RCC_I2C1EN   (1U &lt;&lt; 21)
+#define GPIOB_CRL    (*(volatile uint32_t *)0x40010C00U)
+
+#define I2C1_CR1     (*(volatile uint32_t *)0x40005400U)
+#define I2C1_CR2     (*(volatile uint32_t *)0x40005404U)
+#define I2C1_DR      (*(volatile uint32_t *)0x40005410U)
+#define I2C1_SR1     (*(volatile uint32_t *)0x40005414U)
+#define I2C1_SR2     (*(volatile uint32_t *)0x40005418U)
+#define I2C1_CCR     (*(volatile uint32_t *)0x4000541CU)
+#define I2C1_TRISE   (*(volatile uint32_t *)0x40005420U)
+
+#define I2C_CR1_PE    (1U &lt;&lt; 0)
+#define I2C_CR1_START (1U &lt;&lt; 8)
+#define I2C_CR1_STOP  (1U &lt;&lt; 9)
+#define I2C_SR1_SB    (1U &lt;&lt; 0)
+#define I2C_SR1_ADDR  (1U &lt;&lt; 1)
+#define I2C_SR1_BTF   (1U &lt;&lt; 2)
+#define I2C_SR1_TxE   (1U &lt;&lt; 7)
+
+#define ADXL345_ADDR_7BIT 0x53U   /* alvo ilustrativo - NAO esta no QEMU */
+#define I2C_WAIT_GUARD    200000U
+
+static void i2c1_init(void)
+{
+    /* activa relogios: GPIOB + AFIO (APB2), I2C1 (APB1) */
+    RCC_APB2ENR |= (RCC_IOPBEN | RCC_AFIOEN);
+    RCC_APB1ENR |= RCC_I2C1EN;
+
+    /* PB6 (SCL) e PB7 (SDA): AF open-drain, 50 MHz -> nibble 0xF cada.
+     * nibble de PB6 nos bits [27:24], nibble de PB7 nos bits [31:28] de CRL. */
+    GPIOB_CRL = (GPIOB_CRL &amp; ~((0xFU &lt;&lt; 24) | (0xFU &lt;&lt; 28)))
+                          |  ((0xFU &lt;&lt; 24) | (0xFU &lt;&lt; 28));
+
+    I2C1_CR1 &amp;= ~I2C_CR1_PE;       /* desactiva enquanto configura a temporizacao */
+
+    /* TODO 1: programa os registos de temporizacao para 100 kHz num APB1 de 8 MHz:
+     *   CR2.FREQ = APB1 MHz       (= 8)
+     *   CCR      = PCLK1/(2*SCL)  (= 40)
+     *   TRISE    = (1000ns/Tpclk1)+1 (= 9)  */
+
+    I2C1_CR1 |= I2C_CR1_PE;        /* activa o periferico */
+}
+
+/* Espera limitada: devolve 1 se a flag for activada dentro da guarda, 0 em timeout. */
+static int i2c_wait_flag(uint32_t flag)
+{
+    uint32_t guard = I2C_WAIT_GUARD;
+    /* TODO 2: sonda (I2C1_SR1 &amp; flag) enquanto guard &gt; 0, decrementando guard.
+     *         devolve 1 se for activada, 0 se atingir o timeout. NUNCA um ciclo ilimitado. */
+    return 0; /* substituir */
+}
+
+static void i2c_write_byte(uint8_t addr7, uint8_t reg, uint8_t value)
+{
+    printf("\n[i2c] master-transmit to 0x%02X reg 0x%02X = 0x%02X\n",
+           (unsigned)addr7, (unsigned)reg, (unsigned)value);
+
+    /* TODO 3: define CR1.START. Imprime "step 2: waiting for SB...".
+     *         Se i2c_wait_flag(I2C_SR1_SB) == 0: imprime
+     *         "SB not set - I2C not emulated in QEMU; correct on hardware",
+     *         define CR1.STOP, e retorna (NAO bloqueies). */
+
+    /* TODO 4: escreve (addr7 &lt;&lt; 1)|0 em DR (endereco + bit de escrita).
+     *         espera por ADDR; em timeout reporta e STOP+return. */
+
+    /* TODO 5: limpa ADDR lendo SR1 E DEPOIS SR2 (por essa ordem). */
+
+    /* TODO 6: escreve reg em DR, espera TxE; escreve value em DR, espera BTF;
+     *         em qualquer timeout reporta qual a flag e STOP+return. */
+
+    /* TODO 7: define CR1.STOP para libertar o barramento; imprime "transfer complete". */
+}
+
+int main(void)
+{
+    uart_init();
+    (void)setvbuf(stdout, NULL, _IONBF, 0);
+    printf("\r\n=== Module 12: I2C Driver ===\r\n");
+
+    i2c1_init();
+    i2c_write_byte(ADXL345_ADDR_7BIT, 0x00U, 0x00U);
+
+    printf("\n=== done; reached the end WITHOUT hanging ===\r\n");
+    for (;;) { }
+    return 0;
+}</code></pre>
+
+<h3>3.2 Compilar e executar</h3>
+<p>De dentro da pasta <code>12-i2c/</code>:</p>
+<pre><code>make -f ../common/Makefile SRC=main.c run</code></pre>
+<p>Saída esperada no QEMU: a linha de inicialização, depois a narração da sequência a parar na espera por <code>SB</code> com a mensagem "not emulated", e depois a linha <strong>done</strong>. Se o teu programa bloquear (sem linha "done"), usaste uma espera ilimitada — volta ao TODO 2. Sai do QEMU com <kbd>Ctrl-A</kbd> e depois <kbd>X</kbd>.</p>
+
+<h3>3.3 Dicas</h3>
+<details class="hint">
+  <summary>Dica 1 — os números de temporização (TODO 1)</summary>
+  <p>APB1 = 8 MHz. <code>I2C1_CR2 = 8U;</code> (campo FREQ). Para o modo padrão de 100 kHz <code>I2C1_CCR = 40U;</code> (<code>= 8e6 / (2·100e3)</code>). <code>I2C1_TRISE = 9U;</code> (<code>= 8 + 1</code>, já que um PCLK1 são 125 ns e o tempo de subida máximo do modo padrão é 1000 ns).</p>
+</details>
+<details class="hint">
+  <summary>Dica 2 — uma espera limitada (TODO 2)</summary>
+<pre><code>uint32_t guard = I2C_WAIT_GUARD;
+while (((I2C1_SR1 &amp; flag) == 0U) &amp;&amp; (guard &gt; 0U)) {
+    guard--;
+}
+return (guard &gt; 0U) ? 1 : 0;</code></pre>
+  <p>O essencial é o termo <code>&amp;&amp; (guard &gt; 0U)</code>: garante que o ciclo termina mesmo quando a flag nunca é activada, por isso o QEMU retorna em vez de bloquear.</p>
+</details>
+<details class="hint">
+  <summary>Dica 3 — START e a espera por SB (TODO 3)</summary>
+<pre><code>I2C1_CR1 |= I2C_CR1_START;
+printf("[i2c] step 2: waiting for SB...\n");
+if (i2c_wait_flag(I2C_SR1_SB) == 0) {
+    printf("[i2c] SB not set - I2C not emulated in QEMU; correct on hardware.\n");
+    I2C1_CR1 |= I2C_CR1_STOP;
+    return;
+}</code></pre>
+</details>
+<details class="hint">
+  <summary>Dica 4 — limpar ADDR (TODO 5)</summary>
+  <p>Lê ambos os registos de estado, primeiro SR1 e depois SR2, para uma variável temporária <code>volatile</code> para que o compilador não optimize as leituras:</p>
+<pre><code>volatile uint32_t tmp;
+tmp = I2C1_SR1;
+tmp = I2C1_SR2;
+(void)tmp;</code></pre>
+  <p>Até fazeres isto, o hardware estica SCL em nível baixo e a transferência fica parada.</p>
+</details>
+
+<div class="box ok">
+  <span class="box-title">Solução de referência</span>
+  Solução completa e comentada: <code>solutions/12-i2c.c</code>. Compila sem qualquer aviso e, no QEMU, imprime a narração dos passos e a linha "done" sem bloquear.
+</div>
+
+<!-- ============================== QUESTIONS ============================== -->
+<span class="section-tag">Perguntas de Verificação</span>
+<h2>4. Verifica a tua compreensão</h2>
+
+<details class="answer">
+  <summary>P1. O ADXL345 tem o endereço de 7 bits <code>0x53</code>. Que byte vai para o barramento numa escrita, e o que é ACK/NACK?</summary>
+  <p>O byte de endereço é o endereço de 7 bits deslocado um bit para a esquerda com o bit R/W acrescentado: para uma escrita, <code>(0x53 &lt;&lt; 1) | 0 = 0xA6</code>. Depois de o mestre enviar esses 8 bits, o escravo endereçado puxa SDA para baixo no 9.º ciclo para <strong>ACK</strong> ("existo e estou à escuta"). Se nenhum dispositivo corresponder ao endereço, SDA mantém-se em nível alto — um <strong>NACK</strong> — e em hardware o mestre abortaria. No QEMU não há escravo, por isso nada faz ACK.</p>
+</details>
+<details class="answer">
+  <summary>P2. Porque é que tens de ler <code>SR1</code> e depois <code>SR2</code> para limpar a flag <code>ADDR</code>?</summary>
+  <p>O I2C do STM32F1 limpa <code>ADDR</code> apenas numa leitura de <code>SR1</code> <em>seguida de</em> uma leitura de <code>SR2</code> (RM0041 §26.6.3). A leitura em dois passos existe porque o hardware expõe estado relacionado (por exemplo, papel mestre/escravo, BUSY) entre os dois registos e quer que sejam amostrados em conjunto. Até <code>ADDR</code> ser limpa, o periférico mantém SCL em nível baixo (clock stretch), por isso esquecer este passo bloqueia a transferência. Ler apenas SR1 não é suficiente.</p>
+</details>
+<details class="answer">
+  <summary>P3. O que configura o campo <code>FREQ</code> em <code>CR2</code>, e porquê 8 aqui?</summary>
+  <p><code>CR2.FREQ[5:0]</code> indica ao periférico I2C a frequência do seu relógio de entrada (APB1 / PCLK1) <em>em MHz</em>. O hardware usa isto para temporizar eventos internos como o setup/hold dos dados. <strong>Não</strong> define a frequência de SCL — é o <code>CCR</code> que faz isso. Nesta placa o APB1 corre a 8 MHz (HSI, sem PLL), por isso <code>FREQ = 8</code>. Defini-lo errado torna a temporização derivada do barramento incorrecta em hardware real.</p>
+</details>
+<details class="answer">
+  <summary>P4. O que fazem realmente START e STOP nas linhas, e quem os gera?</summary>
+  <p>O <strong>mestre</strong> gera ambos. Um <strong>START</strong> é SDA a descer enquanto SCL está em nível alto — toma o barramento e (no STM32) activa <code>SR1.SB</code>. Um <strong>STOP</strong> é SDA a subir enquanto SCL está em nível alto — liberta o barramento para que outro mestre o possa usar. Entre um START e um STOP, o mestre é dono do barramento. Definir <code>CR1.START</code> pede o START; definir <code>CR1.STOP</code> pede o STOP.</p>
+</details>
+<details class="answer">
+  <summary>P5. Porque é que este driver não consegue concluir no QEMU, e como o impedimos de bloquear?</summary>
+  <p>A máquina <code>stm32vldiscovery</code> não emula qualquer periférico I2C e não tem escravo no barramento, por isso os registos I2C lêem 0 e <code>SB</code>/<code>ADDR</code>/<code>BTF</code>/<code>TxE</code> nunca são activadas. A primeira espera de flag (por <code>SB</code> após o START) nunca pode, portanto, ter sucesso. Um ingénuo <code>while(!(SR1 &amp; SB)){}</code> rodaria para sempre. Usamos uma <strong>espera limitada</strong>: um contador de guarda que decrementa a cada iteração para que o ciclo saia sempre, após o que imprimimos que passo foi atingido e abortamos de forma limpa. Em hardware real a flag activa em poucas iterações, por isso o mesmo código corre correctamente e conclui a transferência.</p>
+</details>
+
+<div class="modfooter">
+  <a href="../11-dma/11-dma-pt.html">← 11 · DMA</a>
+  <a href="../13-spi/13-spi-pt.html">13 · SPI →</a>
+</div>
+
+</div>
+</body>
+</html>

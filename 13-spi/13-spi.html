@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>13 · SPI Driver — Bare-Metal STM32</title>
+<link rel="stylesheet" href="../common/style.css">
+</head>
+<body>
+
+<nav class="topnav">
+  <a href="../README.md">Home</a>
+  <a href="../glossary.html">Glossary</a>
+  <a href="../12-i2c/12-i2c.html">‹ Prev</a>
+  <a href="../README.md">Course home ›</a>
+  <a href="13-spi-pt.html">🌐 Português</a>
+  <span class="spacer"></span>
+  <span class="badge">STM32F100RBT6 · RM0041</span>
+</nav>
+
+<div class="wrap">
+
+<h1><span class="modnum">Module 13</span> SPI Driver — Full-Duplex Master</h1>
+<p class="subtitle">Configure <code>SPI1</code> as a software-NSS master, then run the classic polled byte exchange: wait <code>TXE</code> → write <code>DR</code> → wait <code>RXNE</code> → read <code>DR</code>. This is the final coding module — and one of the few peripherals where QEMU lets you read your configuration back.</p>
+
+<div class="box note">
+  <span class="box-title">Dependencies</span>
+  This module reuses the polled-UART <code>printf</code> retarget from <a href="../06-uart-transmit/06-uart-transmit.html">Module 06</a> to narrate progress, and the GPIO alternate-function configuration from <a href="../04-gpio-output/04-gpio-output.html">Module 04</a> (<code>CRL/CRH</code>). The bounded-wait discipline is the same one introduced for the unemulated peripherals in Modules 09–12.
+</div>
+
+<!-- ============================== THEORY ============================== -->
+<span class="section-tag">Theory</span>
+<h2>1. What SPI is</h2>
+
+<p>The <strong>S</strong>erial <strong>P</strong>eripheral <strong>I</strong>nterface is a synchronous, <strong>full-duplex</strong>, master/slave bus. Unlike I²C (which has addressing and is half-duplex), SPI uses a dedicated chip-select line per slave and four signals:</p>
+
+<table>
+  <tr><th>Signal</th><th>Direction (from master)</th><th>SPI1 pin</th><th>Meaning</th></tr>
+  <tr><td><code>SCK</code></td><td>output</td><td><code>PA5</code></td><td>Serial clock — the master always generates it</td></tr>
+  <tr><td><code>MISO</code></td><td>input</td><td><code>PA6</code></td><td>Master In, Slave Out — the slave's reply line</td></tr>
+  <tr><td><code>MOSI</code></td><td>output</td><td><code>PA7</code></td><td>Master Out, Slave In — the master's data line</td></tr>
+  <tr><td><code>NSS</code></td><td>output</td><td>(software here)</td><td>Slave select / chip-select, active low</td></tr>
+</table>
+
+<p>There is <strong>no addressing</strong> on the bus — you pick which slave you are talking to by pulling its chip-select low. Bits are shifted out <strong>MSB-first</strong> by default (bit order is selectable via <code>LSBFIRST</code>).</p>
+
+<h3>1.1 Full-duplex means TX and RX happen together</h3>
+<p>SPI is built from two shift registers, one in the master and one in the slave, wired into a ring by <code>MOSI</code> and <code>MISO</code> and clocked by <code>SCK</code>:</p>
+
+<div class="diagram">  MASTER                              SLAVE
+  +-----------------+   MOSI          +-----------------+
+  |  shift reg  >>--|---------------->|--&gt;  shift reg   |
+  |       ^         |   MISO          |        |        |
+  |       |---------|&lt;----------------|--------+        |
+  +-------|---------+   SCK ------&gt;   +-----------------+
+          one SCK pulse shifts ONE bit each way
+
+  Send a byte and you RECEIVE a byte in the same 8 clocks.</div>
+
+<p>Every clocked frame shifts one TX bit out <em>and</em> one RX bit in. So a "transmit" and a "receive" are the same operation: to read from a slave you still have to clock out a (dummy) byte, and to write you still get back whatever the slave happened to put on <code>MISO</code>.</p>
+
+<h3>1.2 Clock modes: CPOL and CPHA</h3>
+<p>Master and slave must agree on the clock's idle level and on which edge samples data. Two bits in <code>CR1</code> select one of four modes:</p>
+
+<table>
+  <tr><th>Mode</th><th>CPOL</th><th>CPHA</th><th>SCK idle</th><th>Data sampled on</th></tr>
+  <tr><td>0</td><td><code>0</code></td><td><code>0</code></td><td>low</td><td>first (rising) edge</td></tr>
+  <tr><td>1</td><td><code>0</code></td><td><code>1</code></td><td>low</td><td>second (falling) edge</td></tr>
+  <tr><td>2</td><td><code>1</code></td><td><code>0</code></td><td>high</td><td>first (falling) edge</td></tr>
+  <tr><td>3</td><td><code>1</code></td><td><code>1</code></td><td>high</td><td>second (rising) edge</td></tr>
+</table>
+<p><strong>CPOL</strong> sets the idle polarity of <code>SCK</code>; <strong>CPHA</strong> chooses whether data is captured on the first or second clock edge of each bit. Mode 0 (both zero) is the most common default — we use it here.</p>
+
+<h3>1.3 The SPI1 registers</h3>
+<p>SPI1 lives at <code>0x40013000</code> on the APB2 bus (RM0041 §25). It is a small peripheral — just four registers matter here:</p>
+
+<table>
+  <tr><th>Register</th><th>Address</th><th>Key bits</th></tr>
+  <tr><td><code>SPI1_CR1</code></td><td><code>0x40013000</code></td><td>bit0 <code>CPHA</code>, bit1 <code>CPOL</code>, bit2 <code>MSTR</code>, bits[5:3] <code>BR</code>, bit6 <code>SPE</code>, bit7 <code>LSBFIRST</code>, bit8 <code>SSI</code>, bit9 <code>SSM</code>, bit11 <code>DFF</code></td></tr>
+  <tr><td><code>SPI1_CR2</code></td><td><code>0x40013004</code></td><td>interrupt / DMA / SS-output enables (not used here)</td></tr>
+  <tr><td><code>SPI1_SR</code></td><td><code>0x40013008</code></td><td>bit0 <code>RXNE</code>, bit1 <code>TXE</code>, bit7 <code>BSY</code></td></tr>
+  <tr><td><code>SPI1_DR</code></td><td><code>0x4001300C</code></td><td>data register (write → TX, read → RX)</td></tr>
+</table>
+
+<p>The interesting <code>CR1</code> bits:</p>
+<ul>
+  <li><code>MSTR</code> (bit 2) — 1 = master mode (we generate <code>SCK</code>).</li>
+  <li><code>BR[5:3]</code> — baud-rate prescaler: divides the APB2 clock (8 MHz here) by 2, 4, 8, 16, … up to 256 (<code>000</code>…<code>111</code>). We use <code>011</code> = ÷16 → 500 kHz <code>SCK</code>.</li>
+  <li><code>SPE</code> (bit 6) — SPI peripheral enable. Set this <strong>last</strong>, after everything else is configured.</li>
+  <li><code>SSM</code> (bit 9) + <code>SSI</code> (bit 8) — <strong>software slave management</strong>. With <code>SSM=1</code> the hardware NSS pin is ignored and the internal NSS level comes from <code>SSI</code> instead. A master <em>must</em> see its NSS held high, so we set <code>SSI=1</code> too.</li>
+  <li><code>DFF</code> (bit 11) — data frame format: 0 = 8-bit, 1 = 16-bit. We use 8-bit.</li>
+  <li><code>LSBFIRST</code> (bit 7) — 0 = MSB first (default), 1 = LSB first.</li>
+</ul>
+
+<div class="box danger">
+  <span class="box-title">⚠ Master mode needs SSM + SSI (or a real NSS)</span>
+  In master mode, if the hardware NSS pin is allowed to go low, the SPI peripheral thinks another master grabbed the bus, clears <code>MSTR</code> and raises a mode-fault (MODF). When you are not wiring a hardware NSS, you <strong>must</strong> set <code>SSM=1</code> (software manage NSS) and <code>SSI=1</code> (drive the internal NSS high) so the master stays a master. Forgetting these is the classic "SPI configures then immediately dies" bug.
+</div>
+
+<h3>1.4 Bring-up sequence</h3>
+<ol>
+  <li>Enable the <code>SPI1</code> clock (<code>RCC_APB2ENR</code> bit 12, <code>SPI1EN</code>) and the GPIOA clock.</li>
+  <li>Configure <code>PA5</code>/<code>PA6</code>/<code>PA7</code> as alternate-function push-pull so SPI1 owns the pins.</li>
+  <li>Write <code>CR1</code>: <code>MSTR | SSM | SSI | BR | SPE</code> (with <code>CPOL=CPHA=0</code>, <code>DFF=0</code>, <code>LSBFIRST=0</code>).</li>
+</ol>
+<p>Then for each byte: wait <code>TXE</code> → write <code>DR</code> → wait <code>RXNE</code> → read <code>DR</code>.</p>
+
+<div class="box warn">
+  <span class="box-title">What QEMU shows — SPI is only PARTIALLY emulated</span>
+  The <code>stm32vldiscovery</code> machine in QEMU emulates the SPI1 <em>registers</em> but attaches <strong>no slave device</strong> (there is no ADXL345, no flash, nothing on <code>MISO</code>). Concretely:
+  <ul>
+    <li><code>CR1</code> <strong>reads back</strong> the value you wrote — so unlike GPIO and I²C, you can actually <em>prove</em> your configuration landed. We print it.</li>
+    <li>The status flags <code>TXE</code> and <code>RXNE</code> are reported set, so the polling flow makes progress and the program does not freeze.</li>
+    <li>But any byte you "receive" by reading <code>DR</code> is <strong>meaningless</strong> — nothing drives <code>MISO</code>. On real hardware, with a real slave selected, that read returns the byte the slave clocked back.</li>
+  </ul>
+  You still use <strong>bounded waits</strong> (a guard counter) on every flag, per the course rule, so a never-setting flag can never hang the program.
+</div>
+
+<!-- ============================== EXERCISE ============================== -->
+<span class="section-tag">Guided Exercise</span>
+<h2>2. SPI1 master + one full-duplex transfer</h2>
+
+<p><strong>Goal:</strong> finish <code>spi1_init()</code> and <code>spi_transfer()</code>, then watch <code>main()</code> print the <code>CR1</code> read-back and the (QEMU-meaningless) received bytes. You will:</p>
+<ol>
+  <li>Enable the SPI1 + GPIOA clocks and set <code>PA5/6/7</code> to AF push-pull.</li>
+  <li>Compose <code>CR1</code> from the right bits and enable the peripheral last.</li>
+  <li>Implement the polled transfer with two <strong>bounded</strong> flag waits.</li>
+</ol>
+
+<h3>2.1 Skeleton — create <code>13-spi/main.c</code></h3>
+<p>Fill in every <code>TODO</code>. The UART/<code>printf</code> plumbing is given (it is identical to Module 06) so you can focus on the SPI logic. Do not look at the reference solution until you have tried the hints.</p>
+
+<pre><code>#include &lt;stdint.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;sys/stat.h&gt;
+
+/* ---- RCC ---- */
+#define RCC_APB2ENR  (*(volatile uint32_t *)0x40021018U)
+#define RCC_IOPAEN   (1U &lt;&lt; 2)
+#define RCC_USART1EN (1U &lt;&lt; 14)
+#define RCC_SPI1EN   (1U &lt;&lt; 12)   /* APB2 bit12 */
+
+/* ---- GPIOA ---- */
+#define GPIOA_CRL    (*(volatile uint32_t *)0x40010800U)  /* pins 0-7  */
+#define GPIOA_CRH    (*(volatile uint32_t *)0x40010804U)  /* pins 8-15 */
+/* PA5/6/7 SPI1 pins, AF push-pull (nibble 0xB) at shifts 20/24/28 */
+#define SPI_PINS_MASK (((uint32_t)0xFU&lt;&lt;20)|((uint32_t)0xFU&lt;&lt;24)|((uint32_t)0xFU&lt;&lt;28))
+#define SPI_PINS_AF   (((uint32_t)0xBU&lt;&lt;20)|((uint32_t)0xBU&lt;&lt;24)|((uint32_t)0xBU&lt;&lt;28))
+/* PA9 = USART1 TX (AF push-pull) */
+#define PA9_CRH_MASK (0xFU &lt;&lt; 4)
+#define PA9_CRH_AF   (0xBU &lt;&lt; 4)
+
+/* ---- USART1 (printf narration) ---- */
+#define USART1_SR    (*(volatile uint32_t *)0x40013800U)
+#define USART1_DR    (*(volatile uint32_t *)0x40013804U)
+#define USART1_BRR   (*(volatile uint32_t *)0x40013808U)
+#define USART1_CR1   (*(volatile uint32_t *)0x4001380CU)
+#define USART_SR_TXE (1U &lt;&lt; 7)
+
+/* ---- SPI1 ---- */
+#define SPI1_CR1     (*(volatile uint32_t *)0x40013000U)
+#define SPI1_SR      (*(volatile uint32_t *)0x40013008U)
+#define SPI1_DR      (*(volatile uint32_t *)0x4001300CU)
+#define SPI_CR1_CPHA (1U &lt;&lt; 0)
+#define SPI_CR1_CPOL (1U &lt;&lt; 1)
+#define SPI_CR1_MSTR (1U &lt;&lt; 2)
+#define SPI_CR1_BR_DIV16 (0x3U &lt;&lt; 3)   /* BR[5:3] = 011 -&gt; fPCLK/16 */
+#define SPI_CR1_SPE  (1U &lt;&lt; 6)
+#define SPI_CR1_SSI  (1U &lt;&lt; 8)
+#define SPI_CR1_SSM  (1U &lt;&lt; 9)
+#define SPI_CR1_DFF  (1U &lt;&lt; 11)
+#define SPI_SR_RXNE  (1U &lt;&lt; 0)
+#define SPI_SR_TXE   (1U &lt;&lt; 1)
+#define WAIT_GUARD   (100000U)
+
+static void uart_putc(uint8_t c) {
+    while ((USART1_SR &amp; USART_SR_TXE) == 0U) { }
+    USART1_DR = (uint32_t)c;
+}
+int _write(int fd, const char *buf, int len) {
+    (void)fd;
+    for (int i = 0; i &lt; len; i++) {
+        if (buf[i] == '\n') { uart_putc((uint8_t)'\r'); }
+        uart_putc((uint8_t)buf[i]);
+    }
+    return len;
+}
+int _read(int f,char*b,int l){(void)f;(void)b;(void)l;return 0;}
+int _close(int f){(void)f;return -1;}
+int _lseek(int f,int o,int d){(void)f;(void)o;(void)d;return 0;}
+int _isatty(int f){(void)f;return 1;}
+int _fstat(int f,struct stat*s){(void)f;if(s)s-&gt;st_mode=S_IFCHR;return 0;}
+
+static void uart_init(void) {
+    RCC_APB2ENR |= (RCC_IOPAEN | RCC_USART1EN);
+    GPIOA_CRH = (GPIOA_CRH &amp; ~PA9_CRH_MASK) | PA9_CRH_AF;
+    USART1_BRR = 0x341U;
+    USART1_CR1 = (1U &lt;&lt; 3) | (1U &lt;&lt; 13);   /* TE | UE */
+}
+
+static void spi1_init(void)
+{
+    /* TODO 1: enable the SPI1 (APB2 bit12) and GPIOA clocks in RCC_APB2ENR */
+
+    /* TODO 2: set PA5/PA6/PA7 to AF push-pull in GPIOA_CRL
+     *         (clear SPI_PINS_MASK, OR in SPI_PINS_AF) */
+
+    /* TODO 3: write SPI1_CR1 = MSTR | SSM | SSI | BR(div16) | SPE
+     *         (leave CPOL, CPHA, DFF, LSBFIRST = 0).
+     *         Remember: SPE goes in this same write, and SSM+SSI are
+     *         REQUIRED for a software-NSS master. */
+}
+
+static uint8_t spi_transfer(uint8_t tx)
+{
+    uint32_t guard;
+
+    /* TODO 4: bounded wait until SPI_SR_TXE is set (room to write).
+     *         guard = WAIT_GUARD; while (TXE==0 &amp;&amp; guard&gt;0) guard--; */
+
+    /* TODO 5: write the byte to SPI1_DR (this starts the clock) */
+
+    /* TODO 6: bounded wait until SPI_SR_RXNE is set (a frame arrived) */
+
+    /* TODO 7: read SPI1_DR and return it (cast to uint8_t).
+     *         In QEMU this byte is meaningless (no slave). */
+    return 0U; /* replace with the DR read */
+}
+
+int main(void)
+{
+    uint8_t rx;
+    uart_init();
+    (void)setvbuf(stdout, NULL, _IONBF, 0);
+
+    printf("\n=== Module 13: SPI Driver ===\n");
+    spi1_init();
+
+    /* CR1 reads back in QEMU - prove the config landed */
+    printf("SPI1_CR1 read-back = 0x%08X\n", (unsigned int)SPI1_CR1);
+
+    rx = spi_transfer(0x9FU);
+    printf("  sent 0x9F -&gt; received 0x%02X\n", (unsigned int)rx);
+    rx = spi_transfer(0xABU);
+    printf("  sent 0xAB -&gt; received 0x%02X\n", (unsigned int)rx);
+    printf("=== done; SPI idle ===\n");
+
+    for (;;) { }
+    return 0;
+}
+</code></pre>
+
+<h3>2.2 Build &amp; run</h3>
+<p>From inside the <code>13-spi/</code> folder:</p>
+<pre><code>make -f ../common/Makefile SRC=main.c run</code></pre>
+<p>You should see the banner, a non-zero <code>SPI1_CR1</code> read-back, two transfer lines, and <code>=== done ===</code>. Quit QEMU with <kbd>Ctrl-A</kbd> then <kbd>X</kbd>. Success: it <strong>compiles with no warnings, prints the CR1 read-back, and does not hang</strong>.</p>
+
+<div class="box ok">
+  <span class="box-title">Expected CR1 read-back</span>
+  With <code>MSTR | SSM | SSI | BR=÷16 | SPE</code> the value is
+  <code>0x4 | 0x200 | 0x100 | 0x18 | 0x40 = 0x35C</code>. QEMU prints
+  <code>SPI1_CR1 read-back = 0x0000035C</code> — concrete proof your bits landed. The received bytes print as <code>0x00</code> (meaningless: no slave drives MISO).
+</div>
+
+<h3>2.3 Hints</h3>
+<details class="hint">
+  <summary>Hint 1 — clocks and pins</summary>
+  <p><code>RCC_APB2ENR |= (RCC_SPI1EN | RCC_IOPAEN);</code> then
+  <code>GPIOA_CRL = (GPIOA_CRL &amp; ~SPI_PINS_MASK) | SPI_PINS_AF;</code>. As always, a peripheral with no clock silently ignores writes.</p>
+</details>
+<details class="hint">
+  <summary>Hint 2 — composing CR1 (don't forget SSM + SSI)</summary>
+  <p>One write does it:
+  <code>SPI1_CR1 = SPI_CR1_MSTR | SPI_CR1_SSM | SPI_CR1_SSI | SPI_CR1_BR_DIV16 | SPI_CR1_SPE;</code>.
+  Leaving out <code>SSM</code>/<code>SSI</code> drops the master out of master mode. <code>SPE</code> is set in the same write (it is fine here because nothing else needs to happen first).</p>
+</details>
+<details class="hint">
+  <summary>Hint 3 — bounded flag waits (never spin forever)</summary>
+  <p>Pattern for both waits:
+  <code>guard = WAIT_GUARD; while (((SPI1_SR &amp; SPI_SR_TXE) == 0U) &amp;&amp; (guard &gt; 0U)) { guard--; }</code>.
+  Repeat with <code>SPI_SR_RXNE</code> for the receive side. The guard only matters if a flag never sets; on real hardware the loop exits early.</p>
+</details>
+<details class="hint">
+  <summary>Hint 4 — write then read DR</summary>
+  <p>Writing <code>SPI1_DR = (uint32_t)tx;</code> launches the clocked exchange. After <code>RXNE</code> is set, <code>return (uint8_t)SPI1_DR;</code> reads the received byte and clears <code>RXNE</code>.</p>
+</details>
+
+<div class="box ok">
+  <span class="box-title">Reference solution</span>
+  Full, commented solution: <code>solutions/13-spi.c</code>. Try every hint first.
+</div>
+
+<!-- ============================== QUESTIONS ============================== -->
+<span class="section-tag">Verification Questions</span>
+<h2>3. Check your understanding</h2>
+
+<details class="answer">
+  <summary>Q1. What do CPOL and CPHA each control, and what is "mode 0"?</summary>
+  <p><code>CPOL</code> sets the idle level of <code>SCK</code> (0 = idle low, 1 = idle high). <code>CPHA</code> selects which clock edge of each bit period samples the data (0 = first edge, 1 = second edge). Mode 0 is <code>CPOL=0, CPHA=0</code>: clock idles low and data is sampled on the first (rising) edge. Master and slave must use the same mode or every byte is garbled.</p>
+</details>
+<details class="answer">
+  <summary>Q2. Why must a software-NSS master set both SSM and SSI?</summary>
+  <p>In master mode the SPI watches its NSS input. If NSS goes low it assumes another master took the bus, clears <code>MSTR</code> and signals a mode fault, so transfers stop. With no hardware NSS wired, you set <code>SSM=1</code> to tell the peripheral to ignore the physical NSS pin and use the internal level from <code>SSI</code> instead, and <code>SSI=1</code> to drive that internal NSS high — keeping the master a master.</p>
+</details>
+<details class="answer">
+  <summary>Q3. What does "full-duplex" mean here — how can one transfer both send and receive?</summary>
+  <p>SPI is a ring of two shift registers (master + slave) joined by <code>MOSI</code> and <code>MISO</code> and driven by a shared <code>SCK</code>. Each clock edge shifts one bit out of the master on <code>MOSI</code> and one bit in from the slave on <code>MISO</code> simultaneously. After 8 clocks the master has sent a byte <em>and</em> received a byte. That is why a "read" still clocks out a dummy byte and a "write" still yields a received byte — transmit and receive are the same physical operation.</p>
+</details>
+<details class="answer">
+  <summary>Q4. What does the BR field do, and what SCK frequency does ÷16 give here?</summary>
+  <p><code>BR[5:3]</code> is the baud-rate prescaler. It divides the SPI's bus clock (APB2 = 8 MHz on this board at reset) by a power of two from 2 (<code>000</code>) to 256 (<code>111</code>). We use <code>011</code> = ÷16, giving <code>SCK</code> = 8 MHz / 16 = 500 kHz. You pick the largest divider (slowest clock) the slave tolerates, or a fast one if it can keep up.</p>
+</details>
+<details class="answer">
+  <summary>Q5. The received bytes print as 0x00 in QEMU. Is the code wrong?</summary>
+  <p>No. QEMU emulates the SPI1 <em>registers</em> (you can even read <code>CR1</code> back as <code>0x35C</code>) and sets the <code>TXE</code>/<code>RXNE</code> flags so the polling flow runs, but it attaches <strong>no slave device</strong> — nothing drives <code>MISO</code>. So the received byte carries no real data and reads back as <code>0x00</code>. On real hardware with a slave selected (e.g. an ADXL345 answering a register read), that same code returns the slave's reply.</p>
+</details>
+<details class="answer">
+  <summary>Q6. What does DFF select, and why did we leave it 0?</summary>
+  <p><code>DFF</code> (bit 11) chooses the frame size: 0 = 8-bit, 1 = 16-bit. Many SPI devices and protocols are byte-oriented, so 8-bit frames are the common default and match our <code>uint8_t</code> transfer helper. Set <code>DFF=1</code> only when a device expects 16-bit words; <code>DFF</code> must not be changed while the SPI is enabled and busy.</p>
+</details>
+
+<div class="box ok">
+  <span class="box-title">🎓 End of the coding track</span>
+  That is the last register-level module. You have driven GPIO, UART, SysTick, timers, the NVIC, DMA, I²C and SPI on bare metal — no HAL, no CMSIS, just the reference manual and <code>volatile</code> pointers. Head back to the <a href="../README.md">course home</a> for next steps and the project ideas.
+</div>
+
+<div class="modfooter">
+  <a href="../12-i2c/12-i2c.html">← 12 · I²C</a>
+  <span class="disabled">End of course</span>
+</div>
+
+</div>
+</body>
+</html>
