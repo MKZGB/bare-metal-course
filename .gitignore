@@ -15,4 +15,18 @@ build/
 *.swp
 *~
 .DS_Store
+
+# Student exercise files (created by the student, not part of the repo)
 01-arm-architecture/example.c
+06-uart-transmit/hello.c
+03-memory-mapped-registers/main.c
+04-gpio-output/main.c
+05-gpio-input/main.c
+06-uart-transmit/main.c
+07-uart-receive/main.c
+08-systick-timer/main.c
+09-general-purpose-timers/main.c
+10-interrupts-nvic/main.c
+11-dma/main.c
+12-i2c/main.c
+13-spi/main.c
