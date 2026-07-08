@@ -222,19 +222,27 @@ _estack = ORIGIN(RAM) + LENGTH(RAM);   /* 0x20000000 + 0x2000 = 0x20002000 */</c
 <p><strong>Objetivo:</strong> provar a ti próprio que o <code>MSP</code> inicial e o vetor de reset estão realmente em <code>0x08000000</code>/<code>0x08000004</code> com os valores que a teoria prevê. Vais construir uma imagem de firmware (reutilizando a solução do Módulo 04 como carga útil — a <em>carga útil</em> não importa; a <em>maquinaria de startup</em> é idêntica para cada módulo) e inspecionar a sua tabela de vetores com os GNU binutils.</p>
 
 <h3>5.1 Construir e fazer dump</h3>
-<p>Executa estes comandos a partir da pasta deste módulo. <code>PREFIX</code> aponta para a toolchain bare-metal:</p>
+<p>Executa estes comandos a partir da pasta deste módulo:</p>
 
-<pre><code>PREFIX=/path/to/arm-gnu-toolchain-13.2.Rel1/bin/arm-none-eabi-
-cd 02-arm-programmer-model
+<pre><code>cd 02-arm-programmer-model
 
-# Build an ELF using the shared Makefile + the module-04 solution as payload.
+# Compila um ELF usando o Makefile partilhado + a solução do módulo 04 como payload.
+make -f ../common/Makefile SRC=../solutions/04-gpio-output.c
+
+# (a) Desmonta: vê os símbolos de entrada e os seus endereços.
+arm-none-eabi-objdump -d build/firmware.elf | head -40
+
+# (b) Hex-dump da secção da tabela de vetores.
+arm-none-eabi-readelf -x .isr_vector build/firmware.elf</code></pre>
+
+<div class="box note">
+  <span class="box-title">Toolchain instalada manualmente?</span>
+  Se não instalaste por <code>apt</code> e tens a toolchain numa pasta qualquer, define o prefixo primeiro e usa-o nos comandos:
+  <pre><code>PREFIX=/caminho/para/arm-gnu-toolchain/bin/arm-none-eabi-
 make -f ../common/Makefile PREFIX=$PREFIX SRC=../solutions/04-gpio-output.c
-
-# (a) Disassemble: see the entry symbols and their addresses.
 ${PREFIX}objdump -d build/firmware.elf | head -40
-
-# (b) Hex-dump the raw vector table section.
 ${PREFIX}readelf -x .isr_vector build/firmware.elf</code></pre>
+</div>
 
 <h3>5.2 O que procurar — a tua tarefa</h3>
 <p>O hex dump do <code>readelf</code> imprime os bytes de <code>.isr_vector</code> começando em <code>0x08000000</code>. Os bytes são mostrados em <strong>little-endian</strong>, por isso uma palavra guardada <code>00 20 00 20</code> lê-se como o valor <code>0x20002000</code>. A tua tarefa:</p>

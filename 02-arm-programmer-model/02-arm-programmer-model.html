@@ -222,19 +222,27 @@ _estack = ORIGIN(RAM) + LENGTH(RAM);   /* 0x20000000 + 0x2000 = 0x20002000 */</c
 <p><strong>Goal:</strong> prove to yourself that the initial <code>MSP</code> and the reset vector really sit at <code>0x08000000</code>/<code>0x08000004</code> with the values the theory predicts. You will build a firmware image (reusing the Module 04 solution as a payload — the <em>payload</em> does not matter; the <em>startup machinery</em> is identical for every module) and inspect its vector table with the GNU binutils.</p>
 
 <h3>5.1 Build and dump</h3>
-<p>Run these from inside this module's folder. <code>PREFIX</code> points at the bare-metal toolchain:</p>
+<p>Run these from inside this module's folder:</p>
 
-<pre><code>PREFIX=/path/to/arm-gnu-toolchain-13.2.Rel1/bin/arm-none-eabi-
-cd 02-arm-programmer-model
+<pre><code>cd 02-arm-programmer-model
 
 # Build an ELF using the shared Makefile + the module-04 solution as payload.
-make -f ../common/Makefile PREFIX=$PREFIX SRC=../solutions/04-gpio-output.c
+make -f ../common/Makefile SRC=../solutions/04-gpio-output.c
 
 # (a) Disassemble: see the entry symbols and their addresses.
-${PREFIX}objdump -d build/firmware.elf | head -40
+arm-none-eabi-objdump -d build/firmware.elf | head -40
 
 # (b) Hex-dump the raw vector table section.
+arm-none-eabi-readelf -x .isr_vector build/firmware.elf</code></pre>
+
+<div class="box note">
+  <span class="box-title">Toolchain instalada manualmente?</span>
+  Se não instalaste por <code>apt</code> e tens a toolchain numa pasta qualquer, define o prefixo primeiro e usa-o nos comandos:
+  <pre><code>PREFIX=/caminho/para/arm-gnu-toolchain/bin/arm-none-eabi-
+make -f ../common/Makefile PREFIX=$PREFIX SRC=../solutions/04-gpio-output.c
+${PREFIX}objdump -d build/firmware.elf | head -40
 ${PREFIX}readelf -x .isr_vector build/firmware.elf</code></pre>
+</div>
 
 <h3>5.2 What to look for — your task</h3>
 <p>The <code>readelf</code> hex dump prints the bytes of <code>.isr_vector</code> starting at <code>0x08000000</code>. Bytes are shown <strong>little-endian</strong>, so a stored word <code>00 20 00 20</code> reads back as the value <code>0x20002000</code>. Your job:</p>
